@@ -3,19 +3,15 @@ import http, { type Server } from 'node:http'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
 const state = vi.hoisted(() => ({
-  calls: [] as Array<{ callbacks: any; signal?: AbortSignal }>,
+  calls: [] as Array<{ signal?: AbortSignal }>,
   releases: [] as Array<ReturnType<typeof vi.fn>>,
-  callModelStreaming: vi.fn(),
+  hermesChatCompletions: vi.fn(),
 }))
 
-vi.mock('../lib/claude-bridge.js', () => ({
-  preWarmCLI: vi.fn(async () => {}),
-  logLatency: vi.fn(),
-}))
-vi.mock('../lib/model-router.js', () => ({ callModelStreaming: state.callModelStreaming }))
-vi.mock('../lib/codex-model-catalog.js', () => ({
-  getCodexModelCatalog: vi.fn(async () => ({ options: [] })),
-  resolveCodexPreferenceForModelId: vi.fn(() => undefined),
+vi.mock('../lib/hermes/api-client.js', () => ({
+  hermesChatCompletions: state.hermesChatCompletions,
+  listHermesModels: vi.fn(async () => [{ id: 'eve' }]),
+  completeOnce: vi.fn(),
 }))
 vi.mock('../lib/response-cache.js', () => ({ tryInstantResponse: vi.fn(() => null) }))
 vi.mock('../lib/maintenance-lifecycle.js', () => ({
@@ -25,6 +21,13 @@ vi.mock('../lib/maintenance-lifecycle.js', () => ({
     return { id: 'lease-test', setPhase: vi.fn(), release }
   }),
   MaintenanceLifecycleError: class MaintenanceLifecycleError extends Error {},
+}))
+vi.mock('../lib/codex-model-catalog.js', () => ({
+  getCodexModelCatalog: vi.fn(async () => ({ options: [] })),
+  resolveCodexPreferenceForModelId: vi.fn(() => undefined),
+}))
+vi.mock('../lib/cursor-model-catalog.js', () => ({
+  resolveCursorPreferenceForModelId: vi.fn(() => undefined),
 }))
 
 import { openaiCompatRouter } from './openai-compat.js'
@@ -49,17 +52,18 @@ afterAll(async () => {
 })
 
 describe('OpenAI-compatible disconnect lifecycle', () => {
-  it('holds the lease through provider abort, then clears inflight state at terminal error', async () => {
+  it('aborts the Hermes passthrough and releases the lease, then accepts a retry', async () => {
     state.calls.length = 0
     state.releases.length = 0
-    state.callModelStreaming.mockReset()
-    state.callModelStreaming.mockImplementation(async (_query: string, _sid: string, callbacks: any, ...args: any[]) => {
-      const options = args.at(-1)
-      state.calls.push({ callbacks, signal: options?.abortSignal })
-      if (state.calls.length === 2) {
-        setTimeout(() => callbacks.onDone('second request completed'), 0)
+    state.hermesChatCompletions.mockReset()
+    state.hermesChatCompletions.mockImplementation(async (_request: unknown, signal?: AbortSignal) => {
+      state.calls.push({ signal })
+      if (state.calls.length === 1) {
+        await new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new Error('G2 client disconnected')), { once: true })
+        })
       }
-      return `session-${state.calls.length}`
+      return { text: 'second request completed', model: 'eve', id: 'chatcmpl-retry' }
     })
 
     const endpoint = new URL('/v1/chat/completions', base)
@@ -86,9 +90,6 @@ describe('OpenAI-compatible disconnect lifecycle', () => {
     await disconnected
     await vi.waitFor(() => expect(state.calls).toHaveLength(1))
     await vi.waitFor(() => expect(state.calls[0].signal?.aborted).toBe(true))
-    expect(state.releases[0]).not.toHaveBeenCalled()
-
-    state.calls[0].callbacks.onError('provider terminal after close')
     await vi.waitFor(() => expect(state.releases[0]).toHaveBeenCalledTimes(1))
 
     const retry = await fetch(endpoint, {
@@ -102,7 +103,7 @@ describe('OpenAI-compatible disconnect lifecycle', () => {
     })
     expect(retry.status).toBe(200)
     expect(await retry.text()).toContain('data: [DONE]')
-    expect(state.callModelStreaming).toHaveBeenCalledTimes(2)
+    expect(state.hermesChatCompletions).toHaveBeenCalledTimes(2)
     expect(state.releases[1]).toHaveBeenCalledTimes(1)
   })
 })

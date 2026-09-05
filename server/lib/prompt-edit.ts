@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { completeOnce } from './hermes/api-client.js'
 
 export const PROMPT_EDIT_DRAFT_MAX_CHARS = 24_000
 export const PROMPT_EDIT_INSTRUCTION_MAX_CHARS = 2_000
@@ -61,119 +61,33 @@ export interface SpawnClaudeTextOptions {
   label?: string
 }
 
-/** Spawn `claude -p` with `prompt` on stdin and resolve its trimmed text output.
- *  No session, no history, no MCP — loads zero MCP servers (--strict-mcp-config) to
- *  skip the ~4s global-MCP cold-start; both callers are pure text transforms, so the
- *  strip is output-neutral. Safety: deletes CLAUDECODE (anti-recursion), repairs
- *  PATH, SIGTERM→2s→SIGKILL on abort/timeout, handles stdin EPIPE. Rejects on
- *  non-zero exit, empty output, timeout, or abort — callers decide the fallback.
- *  Model defaults to `sonnet` and `--model` is ALWAYS passed, so this can never
- *  silently become Opus. */
-export function spawnClaudeText(prompt: string, opts: SpawnClaudeTextOptions = {}): Promise<string> {
-  const model = opts.model || 'sonnet'
-  const effort = opts.effort || 'low'
+/** Utility completion through Hermes. Name kept for meeting-summary callers. */
+export async function spawnClaudeText(prompt: string, opts: SpawnClaudeTextOptions = {}): Promise<string> {
   const timeoutMs = Number.isFinite(opts.timeoutMs) ? (opts.timeoutMs as number) : 45_000
-  const label = opts.label || 'Claude'
+  const label = opts.label || 'Hermes'
   const signal = opts.signal
-
-  return new Promise((resolve, reject) => {
-    const env = { ...process.env }
-    delete env.CLAUDECODE
-    if (!env.PATH?.includes('/opt/homebrew/bin')) {
-      env.PATH = `/opt/homebrew/bin:${env.PATH || ''}`
+  const controller = new AbortController()
+  const onAbort = () => controller.abort()
+  if (signal?.aborted) throw new Error(`${label} aborted`)
+  signal?.addEventListener('abort', onAbort, { once: true })
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const out = (await completeOnce(
+      opts.systemPrompt || 'Return only the requested text. Do not use tools.',
+      prompt,
+      controller.signal,
+    )).trim()
+    if (!out) throw new Error(`${label} returned empty text`)
+    return out
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(signal?.aborted ? `${label} aborted` : `${label} timed out (${timeoutMs}ms)`)
     }
-
-    // Load ZERO MCP servers: skip the 4 global ~/.claude.json servers
-    // (HubSpotDev/google-workspace/open-design/paste) that each cold-spawn a child
-    // process this text-only cleanup never uses (measured ~4s: 12.1s → 7.8s median).
-    // Raw argv (no shell) so the JSON string is unquoted. Output-neutral both callers.
-    const args = ['-p', '--model', model, '--effort', effort, '--output-format', 'text', '--no-session-persistence',
-      '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}']
-    if (opts.systemPrompt) args.push('--system-prompt', opts.systemPrompt)
-
-    const proc = spawn('claude', args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env,
-      cwd: process.cwd(),
-    })
-
-    let stdout = ''
-    let stderr = ''
-    let settled = false
-    let killTimer: NodeJS.Timeout | null = null
-    const finish = (fn: () => void) => {
-      if (settled) return
-      settled = true
-      if (killTimer) clearTimeout(killTimer)
-      clearTimeout(timer)
-      signal?.removeEventListener('abort', onAbort)
-      fn()
-    }
-    const terminate = () => {
-      try { proc.kill('SIGTERM') } catch {}
-      killTimer = setTimeout(() => {
-        try { proc.kill('SIGKILL') } catch {}
-      }, 2000)
-    }
-    const onAbort = () => {
-      finish(() => {
-        terminate()
-        reject(new Error(`${label} aborted`))
-      })
-    }
-    const timer = setTimeout(() => {
-      finish(() => {
-        terminate()
-        reject(new Error(
-          `${label} timed out (${timeoutMs}ms)\n` +
-          `stderr: ${stderr.slice(-300) || '(empty)'}\n` +
-          `stdout: ${stdout.slice(-300) || '(empty)'}`,
-        ))
-      })
-    }, timeoutMs)
-
-    if (signal?.aborted) {
-      onAbort()
-      return
-    }
-    signal?.addEventListener('abort', onAbort, { once: true })
-    proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString() })
-    proc.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString() })
-    proc.on('error', (err) => {
-      finish(() => reject(err))
-    })
-    proc.on('close', (code) => {
-      finish(() => {
-        const out = stdout.trim()
-        if (code !== 0) {
-          reject(new Error(
-            `${label} failed (${code ?? 'unknown'})\n` +
-            `stderr: ${stderr.slice(-300) || '(empty)'}\n` +
-            `stdout: ${out.slice(-300) || 'no output'}`,
-          ))
-          return
-        }
-        if (!out) {
-          reject(new Error(`${label} returned empty text`))
-          return
-        }
-        resolve(out)
-      })
-    })
-    proc.stdin.on('error', (err) => {
-      finish(() => {
-        terminate()
-        reject(err)
-      })
-    })
-
-    try {
-      proc.stdin.write(prompt)
-      proc.stdin.end()
-    } catch (err) {
-      finish(() => reject(err instanceof Error ? err : new Error(String(err))))
-    }
-  })
+    throw error
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener('abort', onAbort)
+  }
 }
 
 export async function applyPromptEdit(input: PromptEditInput, signal?: AbortSignal): Promise<string> {

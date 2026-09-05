@@ -6,7 +6,7 @@
 import { chmodSync, mkdirSync, readdirSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { spawn } from 'node:child_process'
+import { completeOnce } from './hermes/api-client.js'
 import { logTokenAudit } from './token-audit.js'
 import { atomicWriteFileSync, loadJsonOrQuarantine } from './atomic-fs.js'
 import { consumeArchiveLLMBudget } from './archive-budget.js'
@@ -191,45 +191,11 @@ function fallbackDaySummary(chats: ArchivedChat[]): string {
  * through a command string, so shell metacharacters remain inert data.
  */
 function runClaudeArchiveSummary(input: string, instruction: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn('claude', ['-p', '--model', 'sonnet', instruction], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    })
-
-    let stdout = ''
-    let stderr = ''
-    let settled = false
-
-    const finish = (error?: Error) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      if (error) reject(error)
-      else resolve(stdout)
-    }
-
-    const timer = setTimeout(() => {
-      proc.kill('SIGTERM')
-      finish(new Error('Archive summary timed out'))
-    }, 15_000)
-    timer.unref?.()
-
-    proc.stdout.on('data', (chunk: Buffer) => {
-      if (stdout.length < 16_384) stdout += chunk.toString().slice(0, 16_384 - stdout.length)
-    })
-    proc.stderr.on('data', (chunk: Buffer) => {
-      if (stderr.length < 4_096) stderr += chunk.toString().slice(0, 4_096 - stderr.length)
-    })
-    proc.on('error', error => finish(error))
-    proc.on('close', code => {
-      if (code === 0) finish()
-      else finish(new Error(`Archive summary exited ${code}: ${stderr.trim()}`))
-    })
-
-    // Ignore EPIPE here; the close/error handlers above own the final outcome.
-    proc.stdin.on('error', () => {})
-    proc.stdin.end(input)
-  })
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 15_000)
+  timer.unref?.()
+  return completeOnce(instruction, input, controller.signal)
+    .finally(() => clearTimeout(timer))
 }
 
 /** Generate a <60 char summary for a single chat via claude -p.

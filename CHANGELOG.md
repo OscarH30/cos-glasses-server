@@ -1,3 +1,17 @@
+## 7.0.0
+
+Hermes platform. The glasses path is a Hermes gateway transport, not a Cos CLI client.
+
+- **Tier 1 (attention):** ntfy/Telegram → iPhone notification → Even app popup on the G2. See `docs/notifications.md`. Oscar's daily driver is iPhone, so the resident dashboard stays alive with the phone locked.
+- **Tier 2 (interaction):** `hermes-plugin/g2` talks to loopback `/hermes/*`. Durable jobs emit inbound messages; `POST /hermes/deliver` completes them. Approvals land on the display bus and resolve from `POST /api/approvals/:id`.
+- **Tier 3 (pull):** `/v1/chat/completions` passthrough to the Hermes API server with a per-day `X-Hermes-Session-Id`.
+- Cos morning brief and tasks routes return `410 Gone`. Recreate them with `scripts/bootstrap-jobs.sh` as Hermes cron (`deliver: g2,ntfy`).
+- Launcher no longer exits when Claude/Codex/Cursor is missing. Health `mode` is `hermes`.
+- Utility completions (dictation clean, prompt edit, archive titles, meeting summary) use Hermes `completeOnce()`.
+- Cos provider bridges remain in the tree unused on the glasses chat path. They will be deleted after one release so existing module tests can migrate separately. Cos identity strings are gone from the leftover prompt builders.
+
+Do not deploy this fork to the VPS until Oscar says go.
+
 ## 6.44.4
 
 Stage, a finish line, and no dispatch without one.

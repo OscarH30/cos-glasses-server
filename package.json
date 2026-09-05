@@ -1,7 +1,7 @@
 {
   "name": "@gotcos/glasses-server",
-  "version": "6.44.4",
-  "description": "COS Glasses \u2014 self-hosted AI heads-up-display server for Even G2 smart glasses, powered by Claude Code, Codex, Cursor Agent CLI, or local Ollama",
+  "version": "7.0.0",
+  "description": "Even G2 glasses server — Hermes gateway platform transport for Eve on iPhone",
   "type": "module",
   "bin": {
     "glasses-server": "bin/cli.cjs",
@@ -41,7 +41,10 @@
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
-    "SECURITY.md"
+    "SECURITY.md",
+    "docs",
+    "hermes-plugin",
+    "scripts"
   ],
   "author": "COS Contributors",
   "license": "MIT",

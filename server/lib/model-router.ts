@@ -1,7 +1,5 @@
-import { callClaudeStreaming, type CallOptions, type StreamCallbacks } from './claude-bridge.js'
-import { callCodexStreaming } from './codex-bridge.js'
-import { callCursorStreaming } from './cursor-bridge.js'
-import { callOllamaStreaming } from './ollama-bridge.js'
+import { type CallOptions, type StreamCallbacks } from './claude-bridge.js'
+import { callHermesStreaming } from './hermes/bridge.js'
 import {
   getOrCreateSession,
   getSessionModel,
@@ -11,21 +9,8 @@ import {
 } from './conversation.js'
 import {
   DEFAULT_MODEL,
-  isCodexModel,
-  isClaudeModel,
-  isCursorModel,
-  isOllamaModel,
   normalizeModelPreference,
 } from '../../shared/model-preference.js'
-import {
-  getCursorModelCatalog,
-  isCursorProviderReady,
-  resolveCursorModelOption,
-} from './cursor-model-catalog.js'
-import {
-  getOllamaCatalog,
-  isOllamaProviderReady,
-} from './ollama-catalog.js'
 import type { ModelImageInput } from './model-image-input.js'
 
 // Bridges return as soon as their subprocess is spawned, while completion is
@@ -105,38 +90,7 @@ export async function callModelStreaming(
   }
 
   try {
-    if (options?.dispatch && !isClaudeModel(resolvedModel)) {
-      await lockedCallbacks.onError('dispatch_requires_claude')
-      return sid
-    }
-    // Cursor slots fail closed — never fall through to Claude/Codex.
-    if (isCursorModel(resolvedModel)) {
-      await getCursorModelCatalog()
-      const option = resolveCursorModelOption(resolvedModel)
-      if (!isCursorProviderReady() || !option?.id) {
-        const message = !option?.id
-          ? `cursor-bridge: Cursor model slot ${resolvedModel} is not resolved. Check agent models / login.`
-          : 'cursor-bridge: Cursor CLI unavailable. Install agent and run agent login.'
-        await lockedCallbacks.onError(message)
-        return sid
-      }
-      return await callCursorStreaming(query, sid, lockedCallbacks, resolvedModel, images, reference, globalMsgNum, options)
-    }
-    if (isOllamaModel(resolvedModel)) {
-      await getOllamaCatalog()
-      if (!isOllamaProviderReady()) {
-        await lockedCallbacks.onError('ollama-bridge: Ollama is not running. Start ollama serve on this Mac.')
-        return sid
-      }
-      return await callOllamaStreaming(query, sid, lockedCallbacks, images, reference, globalMsgNum, options)
-    }
-    if (isCodexModel(resolvedModel)) {
-      return await callCodexStreaming(query, sid, lockedCallbacks, resolvedModel, images, reference, globalMsgNum, options)
-    }
-    if (isClaudeModel(resolvedModel)) {
-      return await callClaudeStreaming(query, sid, lockedCallbacks, resolvedModel, images, reference, globalMsgNum, options)
-    }
-    return await callClaudeStreaming(query, sid, lockedCallbacks, DEFAULT_MODEL, images, reference, globalMsgNum, options)
+    return await callHermesStreaming(query, sid, lockedCallbacks, resolvedModel, images, reference, globalMsgNum, options)
   } catch (err) {
     releaseTerminal()
     throw err

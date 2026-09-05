@@ -1,19 +1,8 @@
-// OpenAI-compatible /v1/chat/completions endpoint
-// Adapter for Even Realities "Add Agent" and any OpenAI-compatible client.
-// Accepts standard OpenAI format, routes through COS model-router, returns OpenAI format.
-// Supports both streaming (SSE) and non-streaming responses.
+// OpenAI-compatible /v1/chat/completions — Even Realities "Add Agent" (Tier 3).
+// Passthrough to the Hermes API server. Cos model ids remain accepted aliases
+// for one release and resolve to the default Hermes profile.
 
 import { Router } from 'express'
-import { preWarmCLI, logLatency } from '../lib/claude-bridge.js'
-import { callModelStreaming } from '../lib/model-router.js'
-import { normalizeModelPreference, DEFAULT_MODEL, type ModelPreference } from '../../shared/model-preference.js'
-import {
-  getCodexModelCatalog,
-  resolveCodexPreferenceForModelId,
-} from '../lib/codex-model-catalog.js'
-import { resolveCursorPreferenceForModelId } from '../lib/cursor-model-catalog.js'
-import { tryInstantResponse } from '../lib/response-cache.js'
-
 import crypto from 'node:crypto'
 import { timingSafeTokenEqual } from '../lib/token-auth.js'
 import {
@@ -21,72 +10,64 @@ import {
   MaintenanceLifecycleError,
   type MaintenanceWorkLease,
 } from '../lib/maintenance-lifecycle.js'
+import { tryInstantResponse } from '../lib/response-cache.js'
+import { hermesChatCompletions, listHermesModels } from '../lib/hermes/api-client.js'
+import { loadHermesConfig } from '../lib/hermes/config.js'
+import { normalizeAgentPreference } from '../../shared/agent-preference.js'
+import { normalizeModelPreference, DEFAULT_MODEL, type ModelPreference } from '../../shared/model-preference.js'
+import {
+  getCodexModelCatalog,
+  resolveCodexPreferenceForModelId,
+} from '../lib/codex-model-catalog.js'
+import { resolveCursorPreferenceForModelId } from '../lib/cursor-model-catalog.js'
 
 export const openaiCompatRouter = Router()
 
-// ─── Dedup guard — prevent Even from doubling server load ───
-// Maps query text → { promise, timestamp } for in-flight requests.
-// If the same query arrives within 2s of a pending request, reuse the result.
 const inflightQueries = new Map<string, { promise: Promise<string>; timestamp: number }>()
 const DEDUP_WINDOW_MS = 2000
 
 function cleanupInflight() {
   const now = Date.now()
   for (const [key, entry] of inflightQueries) {
-    if (now - entry.timestamp > 30000) inflightQueries.delete(key) // 30s max
+    if (now - entry.timestamp > 30_000) inflightQueries.delete(key)
   }
 }
 
-// ─── Daily persistent session ───
-// Session persists across all G2 queries for the entire day, building context
-// as the user explores concepts, checks facts, follows threads.
-// Auto-resets at midnight to prevent context rot.
-// Say "reset session" or "new session" to force reset.
-let g2SessionId: string | undefined = undefined
-let g2SessionDate: string | undefined = undefined  // YYYY-MM-DD of current session
+let g2SessionSuffix = ''
+let g2SessionDate: string | undefined
 
-function getOrResetG2Session(): string | undefined {
+function hermesDaySession(query: string): { sessionId: string; sessionKey: string } {
   const today = new Date().toISOString().slice(0, 10)
   if (g2SessionDate !== today) {
-    // New day — reset session to prevent context rot
-    g2SessionId = undefined
     g2SessionDate = today
-    console.log(`[g2] Daily session reset (${today})`)
-    // Lazy pre-warm: fire-and-forget so next query has a warm CLI session
-    preWarmCLI().catch(() => {})
+    g2SessionSuffix = ''
   }
-  return g2SessionId
+  if (/\b(reset session|new session|fresh start|clear context|start over)\b/i.test(query)) {
+    g2SessionSuffix = `-${Date.now()}`
+  }
+  const config = loadHermesConfig()
+  return {
+    sessionId: `g2-${today}${g2SessionSuffix}`,
+    sessionKey: `${config.sessionKeyPrefix}:${config.defaultProfile}`,
+  }
 }
 
-function shouldResetSession(query: string): boolean {
-  return /\b(reset session|new session|fresh start|clear context|start over)\b/i.test(query)
-}
-
-// Optional: validate Bearer token against COS_API_TOKEN
 function validateAuth(req: any, res: any): boolean {
   const cosToken = process.env.COS_API_TOKEN
-  if (!cosToken) return true // No token configured = open access
+  if (!cosToken) return true
 
   const auth = req.headers['authorization']
   if (!auth || !auth.startsWith('Bearer ')) {
     res.status(401).json({ error: { message: 'Missing Bearer token', type: 'invalid_request_error' } })
     return false
   }
-
-  const token = auth.slice(7)
-  if (!timingSafeTokenEqual(token, cosToken)) {
+  if (!timingSafeTokenEqual(auth.slice(7), cosToken)) {
     res.status(401).json({ error: { message: 'Invalid token', type: 'invalid_request_error' } })
     return false
   }
-
   return true
 }
 
-/**
- * Pick the model id an OpenAI-compatible request asked for. A `?model=` on the
- * completion URL wins over the request body, so an Even "Add Agent" endpoint
- * can pin a slot even though the client hardcodes a generic body model.
- */
 export function selectOpenAICompatibleModel(
   bodyModel?: string,
   urlModel?: string,
@@ -97,8 +78,6 @@ export function selectOpenAICompatibleModel(
   return fromBody || undefined
 }
 
-// Resolve model from OpenAI-compatible ids, stable app slots, or concrete ids
-// currently advertised by the live Codex / Cursor catalogs.
 export function resolveModel(model?: string, _query?: string): ModelPreference {
   const normalized = normalizeModelPreference(model)
   if (normalized) return normalized
@@ -118,49 +97,68 @@ export function resolveModel(model?: string, _query?: string): ModelPreference {
   return normalizeModelPreference(process.env.COS_G2_DEFAULT_MODEL) ?? DEFAULT_MODEL
 }
 
-const MODEL_NAMES: Record<ModelPreference, string> = {
-  opus: 'cos-opus',
-  fable: 'cos-fable',
-  sonnet: 'cos-sonnet',
-  haiku: 'cos-haiku',
-  'codex-frontier': 'cos-gpt-frontier',
-  'codex-balanced': 'cos-gpt-balanced',
-  'cursor-grok': 'cursor-grok',
-  'cursor-composer': 'cursor-composer',
-  ollama: 'cos-ollama',
+function resolveHermesProfile(model?: string): string {
+  return normalizeAgentPreference(model).profile
 }
-// Extract the user's latest message from the OpenAI messages array
-function extractUserQuery(messages: Array<{ role: string; content: string }>): string {
-  // Find the last user message
+
+function extractUserQuery(messages: Array<{ role: string; content: unknown }>): string {
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === 'user' && messages[i].content) {
-      return messages[i].content
+    const row = messages[i]
+    if (row.role !== 'user') continue
+    if (typeof row.content === 'string' && row.content) return row.content
+    if (Array.isArray(row.content)) {
+      const text = row.content
+        .filter((part): part is { type: 'text'; text: string } => part && part.type === 'text' && typeof part.text === 'string')
+        .map(part => part.text)
+        .join('\n')
+        .trim()
+      if (text) return text
     }
   }
   return ''
+}
+
+function writeStreamText(
+  res: { write: (chunk: string) => void; end: () => void },
+  completionId: string,
+  timestamp: number,
+  responseModel: string,
+  text: string,
+): void {
+  res.write(`data: ${JSON.stringify({
+    id: completionId,
+    object: 'chat.completion.chunk',
+    created: timestamp,
+    model: responseModel,
+    choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+  })}\n\n`)
+  res.write(`data: ${JSON.stringify({
+    id: completionId,
+    object: 'chat.completion.chunk',
+    created: timestamp,
+    model: responseModel,
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+  })}\n\n`)
+  res.write('data: [DONE]\n\n')
 }
 
 openaiCompatRouter.post('/v1/chat/completions', async (req, res) => {
   if (!validateAuth(req, res)) return
 
   const { messages, stream, model } = req.body
-
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({
       error: { message: 'messages array required', type: 'invalid_request_error' },
     })
   }
 
-  let query = extractUserQuery(messages)
+  const query = extractUserQuery(messages)
   if (!query) {
     return res.status(400).json({
       error: { message: 'No user message found', type: 'invalid_request_error' },
     })
   }
 
-  // Admission closes before cache lookup, dedup bookkeeping, latency logging,
-  // or provider work. Maintenance therefore has one linearization point for
-  // every OpenAI-compatible request, including instant and duplicate replies.
   let maintenanceLease: MaintenanceWorkLease
   try {
     maintenanceLease = acquireMaintenanceWork('openai_query')
@@ -179,122 +177,59 @@ openaiCompatRouter.post('/v1/chat/completions', async (req, res) => {
     throw error
   }
 
-
-  // Log request entry — tells us if Even sends stream: true or false
-  console.log(`[g2] Request: stream=${!!stream}, query="${query.slice(0, 50)}"`)
-
-  const requestReceivedAt = Date.now()
   const selectedModel = selectOpenAICompatibleModel(
     model,
     typeof req.query.model === 'string' ? req.query.model : undefined,
   )
-  const resolvedModel = resolveModel(selectedModel, query)
+  const profile = resolveHermesProfile(selectedModel)
   const completionId = `chatcmpl-${crypto.randomUUID().slice(0, 12)}`
   const timestamp = Math.floor(Date.now() / 1000)
-  const responseModel = MODEL_NAMES[resolvedModel]
+  const responseModel = profile
 
-  // ── Predictive response cache — bypass Claude for common queries ──
   const cached = tryInstantResponse(query)
   if (cached) {
-    const ttfb = Date.now() - requestReceivedAt
-    logLatency({
-      timestamp: new Date().toISOString(),
-      query: query.slice(0, 50),
-      ttfb_ms: ttfb,
-      total_ms: ttfb,
-      model: 'cache',
-      resumed: false,
-      contextInjected: false,
-      cacheHit: true,
-    })
-    console.log(`[g2] Cache hit (${cached.pattern}): "${query}" → ${ttfb}ms`)
-
     if (stream) {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
+        Connection: 'keep-alive',
         'X-Accel-Buffering': 'no',
-    'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Origin': '*',
       })
       res.flushHeaders()
-      const chunk = {
-        id: completionId,
-        object: 'chat.completion.chunk',
-        created: timestamp,
-        model: responseModel,
-        choices: [{ index: 0, delta: { content: cached.text }, finish_reason: null }],
-      }
-      res.write(`data: ${JSON.stringify(chunk)}\n\n`)
-      const finalChunk = {
-        id: completionId,
-        object: 'chat.completion.chunk',
-        created: timestamp,
-        model: responseModel,
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-      }
-      res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
-      res.write('data: [DONE]\n\n')
+      writeStreamText(res, completionId, timestamp, responseModel, cached.text)
       res.end()
       maintenanceLease.release()
       return
     }
-
-    // Non-streaming cache response
     const response = res.json({
       id: completionId,
       object: 'chat.completion',
       created: timestamp,
       model: responseModel,
-      choices: [{
-        index: 0,
-        message: { role: 'assistant', content: cached.text },
-        finish_reason: 'stop',
-      }],
+      choices: [{ index: 0, message: { role: 'assistant', content: cached.text }, finish_reason: 'stop' }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     })
     maintenanceLease.release()
     return response
   }
 
-  // ── Dedup guard — if same query is already in-flight within 2s, reuse result ──
   cleanupInflight()
-  const dedupKey = `${resolvedModel}:${query.trim().toLowerCase()}`
+  const dedupKey = `${profile}:${query.trim().toLowerCase()}`
   const inflight = inflightQueries.get(dedupKey)
   if (inflight && (Date.now() - inflight.timestamp) < DEDUP_WINDOW_MS) {
-    console.log(`[g2] Dedup hit: "${query.slice(0, 50)}" (waiting for in-flight result)`)
     try {
       const dedupResult = await inflight.promise
-      logLatency({
-        timestamp: new Date().toISOString(),
-        query: query.slice(0, 50),
-        ttfb_ms: Date.now() - requestReceivedAt,
-        total_ms: Date.now() - requestReceivedAt,
-        model: resolvedModel,
-        resumed: false,
-        contextInjected: false,
-        cacheHit: false,
-        deduped: true,
-      })
       if (stream) {
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
+          Connection: 'keep-alive',
           'X-Accel-Buffering': 'no',
-    'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Origin': '*',
         })
         res.flushHeaders()
-        const chunk = {
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created: timestamp,
-          model: responseModel,
-          choices: [{ index: 0, delta: { content: dedupResult }, finish_reason: null }],
-        }
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`)
-        res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: timestamp, model: responseModel, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`)
-        res.write('data: [DONE]\n\n')
+        writeStreamText(res, completionId, timestamp, responseModel, dedupResult)
         res.end()
         maintenanceLease.release()
         return
@@ -310,22 +245,19 @@ openaiCompatRouter.post('/v1/chat/completions', async (req, res) => {
       maintenanceLease.release()
       return response
     } catch {
-      // Original request failed — fall through to make a fresh request
+      /* fall through */
     }
   }
 
-  // Register this query as in-flight for dedup
-  let resolveInflight: (text: string) => void
-  let rejectInflight: (err: any) => void
-  const inflightPromise = new Promise<string>((res, rej) => { resolveInflight = res; rejectInflight = rej })
-  void inflightPromise.catch(() => { /* duplicate waiters observe the original rejection */ })
+  let resolveInflight!: (text: string) => void
+  let rejectInflight!: (err: unknown) => void
+  const inflightPromise = new Promise<string>((resolve, reject) => {
+    resolveInflight = resolve
+    rejectInflight = reject
+  })
+  void inflightPromise.catch(() => {})
   inflightQueries.set(dedupKey, { promise: inflightPromise, timestamp: Date.now() })
 
-  // Register disconnect cancellation before the provider starts. G2 can abort
-  // its first fetch while Claude/Codex continues running; without this signal
-  // the provider and its maintenance lease can strand a Control restart for
-  // the full model timeout. The lease is released only after the bridge reaches
-  // its terminal callback/catch, never merely because the socket disappeared.
   const providerAbort = new AbortController()
   let responseFinished = false
   let clientDisconnected = false
@@ -336,244 +268,98 @@ openaiCompatRouter.post('/v1/chat/completions', async (req, res) => {
     providerAbort.abort(new Error('G2 client disconnected'))
   })
 
-  // ── Streaming response (SSE) ──
+  const session = hermesDaySession(query)
+  const runCompletion = () => hermesChatCompletions({
+    messages: [{ role: 'user', content: query }],
+    sessionId: session.sessionId,
+    sessionKey: session.sessionKey,
+    model: profile,
+  }, providerAbort.signal)
+
   if (stream) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
+      Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
-    'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Origin': '*',
     })
     res.flushHeaders()
-
-    // Immediate keepalive — prevents ER app timeout while Claude processes
     res.write(': keepalive\n\n')
-
-    let done = false
-    let firstChunkLogged = false
-    let actualTtfbMs = -1  // Captured at first chunk arrival
-
-    // Check for session reset command
-    if (shouldResetSession(query)) {
-      g2SessionId = undefined
-      g2SessionDate = new Date().toISOString().slice(0, 10)
-      console.log(`[g2] Manual session reset`)
-    }
-
-    const currentSessionId = getOrResetG2Session()
-
-    // Pass query directly — conciseness instruction is in the system prompt now
     try {
-      const returnedSid = await callModelStreaming(query, currentSessionId, {
-        onChunk: (text) => {
-          if (!done && !clientDisconnected) {
-            if (!firstChunkLogged) {
-              firstChunkLogged = true
-              actualTtfbMs = Date.now() - requestReceivedAt
-              console.log(`[g2] TTFB: ${actualTtfbMs}ms (${resolvedModel}, session: ${currentSessionId ? 'resumed' : 'new'})`)
-            }
-            const chunk = {
-              id: completionId,
-              object: 'chat.completion.chunk',
-              created: timestamp,
-              model: responseModel,
-              choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-            }
-            res.write(`data: ${JSON.stringify(chunk)}\n\n`)
-          }
-        },
-        onDone: (fullText) => {
-          try {
-            if (!done) {
-              done = true
-              resolveInflight!(fullText || '')
-              inflightQueries.delete(dedupKey)
-              logLatency({
-              timestamp: new Date().toISOString(),
-              query: query.slice(0, 50),
-              ttfb_ms: actualTtfbMs,
-              total_ms: Date.now() - requestReceivedAt,
-              model: resolvedModel,
-              resumed: !!currentSessionId,
-              contextInjected: /\b(schedule|calendar|meeting|task|tasks|today|tomorrow|next meeting|who do i meet|what's next)\b/i.test(query),
-              cacheHit: false,
-              stream_requested: true,
-              })
-              // Final chunk with finish_reason
-              if (!clientDisconnected) {
-                const finalChunk = {
-                  id: completionId,
-                  object: 'chat.completion.chunk',
-                  created: timestamp,
-                  model: responseModel,
-                  choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-                }
-                res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
-                res.write('data: [DONE]\n\n')
-                res.end()
-              }
-            }
-          } finally {
-            maintenanceLease.release()
-          }
-        },
-        onError: (error) => {
-          try {
-            if (!done) {
-              done = true
-              rejectInflight!(new Error(error))
-              inflightQueries.delete(dedupKey)
-              if (!clientDisconnected) {
-                const errChunk = {
-                  id: completionId,
-                  object: 'chat.completion.chunk',
-                  created: timestamp,
-                  model: responseModel,
-                  choices: [{ index: 0, delta: { content: `Error: ${error}` }, finish_reason: 'stop' }],
-                }
-                res.write(`data: ${JSON.stringify(errChunk)}\n\n`)
-                res.write('data: [DONE]\n\n')
-                res.end()
-              }
-            }
-          } finally {
-            maintenanceLease.release()
-          }
-        },
-        onToolStatus: (status) => {
-          if (!done && !clientDisconnected) {
-            // SSE comment — invisible to JSON parsers but keeps connection alive
-            res.write(`: ${status}\n\n`)
-          }
-        },
-        onStart: () => {},
-      }, resolvedModel, undefined, undefined, undefined, {
-        lightweight: true,
-        abortSignal: providerAbort.signal,
-      })
-      // Persist session ID for multi-turn context on subsequent G2 queries
-      g2SessionId = returnedSid
-    } catch (err: any) {
-      maintenanceLease.release()
-      if (!done) {
-        done = true
-        rejectInflight!(err)
-        inflightQueries.delete(dedupKey)
-        if (!clientDisconnected) {
-          res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`)
-          res.write('data: [DONE]\n\n')
-          res.end()
-        }
+      const result = await runCompletion()
+      resolveInflight(result.text)
+      inflightQueries.delete(dedupKey)
+      if (!clientDisconnected) {
+        writeStreamText(res, completionId, timestamp, result.model || responseModel, result.text)
+        res.end()
       }
+    } catch (err: any) {
+      rejectInflight(err)
+      inflightQueries.delete(dedupKey)
+      if (!clientDisconnected) {
+        res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`)
+        res.write('data: [DONE]\n\n')
+        res.end()
+      }
+    } finally {
+      maintenanceLease.release()
     }
     return
   }
 
-  // ── Non-streaming response ──
-  // Check for session reset command
-  if (shouldResetSession(query)) {
-    g2SessionId = undefined
-    g2SessionDate = new Date().toISOString().slice(0, 10)
-    console.log(`[g2] Manual session reset (non-stream)`)
-  }
-
-  const currentSessionIdNS = getOrResetG2Session()
-
   try {
-    const fullText = await new Promise<string>((resolve, reject) => {
-      let result = ''
-      let nsFirstChunkMs = -1
-      let settled = false
-      const fail = (error: unknown) => {
-        if (settled) return
-        settled = true
-        maintenanceLease.release()
-        const err = error instanceof Error ? error : new Error(String(error))
-        rejectInflight!(err)
-        inflightQueries.delete(dedupKey)
-        reject(err)
-      }
-      callModelStreaming(query, currentSessionIdNS, {
-        onChunk: (text) => {
-          if (nsFirstChunkMs < 0) nsFirstChunkMs = Date.now() - requestReceivedAt
-          result += text
-        },
-        onDone: (fullText) => {
-          if (settled) return
-          settled = true
-          try {
-            const text = fullText || result
-            resolveInflight!(text)
-            inflightQueries.delete(dedupKey)
-            logLatency({
-              timestamp: new Date().toISOString(),
-              query: query.slice(0, 50),
-              ttfb_ms: nsFirstChunkMs,
-              total_ms: Date.now() - requestReceivedAt,
-              model: resolvedModel,
-              resumed: !!currentSessionIdNS,
-              contextInjected: /\b(schedule|calendar|meeting|task|tasks|today|tomorrow)\b/i.test(query),
-              cacheHit: false,
-              stream_requested: false,
-            })
-            resolve(text)
-          } finally {
-            maintenanceLease.release()
-          }
-        },
-        onError: (error) => {
-          fail(new Error(error))
-        },
-        onToolStatus: () => {},
-        onStart: () => {},
-      }, resolvedModel, undefined, undefined, undefined, {
-        lightweight: true,
-        abortSignal: providerAbort.signal,
+    const result = await runCompletion()
+    resolveInflight(result.text)
+    inflightQueries.delete(dedupKey)
+    if (!clientDisconnected) {
+      res.json({
+        id: result.id || completionId,
+        object: 'chat.completion',
+        created: timestamp,
+        model: result.model || responseModel,
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: result.text },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       })
-        .then(sid => { g2SessionId = sid })
-        .catch(fail)
-    })
-
-    if (clientDisconnected) return
-    res.json({
-      id: completionId,
-      object: 'chat.completion',
-      created: timestamp,
-      model: responseModel,
-      choices: [{
-        index: 0,
-        message: { role: 'assistant', content: fullText },
-        finish_reason: 'stop',
-      }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    })
+    }
   } catch (err: any) {
-    if (clientDisconnected) return
-    res.status(500).json({
-      error: { message: err.message, type: 'server_error' },
-    })
+    rejectInflight(err)
+    inflightQueries.delete(dedupKey)
+    if (!clientDisconnected) {
+      res.status(500).json({
+        error: { message: err.message, type: 'server_error' },
+      })
+    }
+  } finally {
+    maintenanceLease.release()
   }
 })
 
-// GET /v1/models — required by some clients for model discovery
 openaiCompatRouter.get('/v1/models', async (_req, res) => {
-  const catalog = await getCodexModelCatalog()
+  const models = await listHermesModels()
+  const catalog = await getCodexModelCatalog().catch(() => ({ options: [] as Array<{ id?: string }> }))
   res.json({
     object: 'list',
-	    data: [
-	      { id: 'cos-opus', object: 'model', created: 1709251200, owned_by: 'cos' },
-	      { id: 'cos-fable', object: 'model', created: 1709251200, owned_by: 'cos' },
-	      { id: 'cos-sonnet', object: 'model', created: 1709251200, owned_by: 'cos' },
-	      { id: 'cos-haiku', object: 'model', created: 1709251200, owned_by: 'cos' },
-	      { id: 'cos-gpt-frontier', object: 'model', created: 1709251200, owned_by: 'cos' },
-	      { id: 'cos-gpt-balanced', object: 'model', created: 1709251200, owned_by: 'cos' },
-	      ...catalog.options.filter(option => option.id).map(option => ({
-	        id: option.id,
-	        object: 'model',
-	        created: 1709251200,
-	        owned_by: 'openai',
-	      })),
-	    ],
-	  })
-	})
+    data: [
+      ...models.map(model => ({
+        id: model.id,
+        object: 'model',
+        created: 1_709_251_200,
+        owned_by: 'hermes',
+      })),
+      { id: 'cos-sonnet', object: 'model', created: 1_709_251_200, owned_by: 'hermes' },
+      { id: 'cos-opus', object: 'model', created: 1_709_251_200, owned_by: 'hermes' },
+      { id: 'cos-haiku', object: 'model', created: 1_709_251_200, owned_by: 'hermes' },
+      ...catalog.options.filter(option => option.id).map(option => ({
+        id: option.id,
+        object: 'model',
+        created: 1_709_251_200,
+        owned_by: 'hermes',
+      })),
+    ],
+  })
+})

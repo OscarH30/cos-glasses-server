@@ -8,7 +8,7 @@ const bus = new EventEmitter()
 bus.setMaxListeners(20) // Multiple glasses clients
 
 export interface DisplayEvent {
-  type: 'chunk' | 'done' | 'error' | 'tool_status' | 'start' | 'session_restore' | 'transcript_chunk' | 'prompt_transcript' | 'recording_start' | 'recording_stop' | 'coaching_nudge'
+  type: 'chunk' | 'done' | 'error' | 'tool_status' | 'start' | 'session_restore' | 'transcript_chunk' | 'prompt_transcript' | 'recording_start' | 'recording_stop' | 'coaching_nudge' | 'hermes_message' | 'approval_required' | 'approval_resolved' | 'agent_status'
   data: Record<string, unknown>
 }
 

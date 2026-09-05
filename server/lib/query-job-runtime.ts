@@ -1,8 +1,8 @@
 import { carriesBoundTo } from './agent-session-binding-store.js'
 import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
-import { acquireModelSessionRunLock, callModelStreaming } from './model-router.js'
-import { emitDisplay } from './display-bus.js'
+import { acquireModelSessionRunLock } from './model-router.js'
+import { runHermesPlatformTurn } from './hermes/turn-runner.js'
 import { resolveQueryAttachments } from './query-attachments.js'
 import { getMediaStore } from './media-store.js'
 import { dataPath } from './data-dir.js'
@@ -11,12 +11,7 @@ import { durableQueryJobsEnabled } from './query-job-feature.js'
 import { QueryJobCoordinator, type QueryJobRunner } from './query-job-coordinator.js'
 import { QueryJobStore } from './query-job-store.js'
 import {
-  isCodexModel,
-  isCursorModel,
-  isOllamaModel,
-  normalizeEffortPreference,
   normalizeModelPreference,
-  type CursorExecutionMode,
   type ModelPreference,
 } from '../../shared/model-preference.js'
 import { mergeMediaAttachmentRefs } from '../../shared/media-attachment.js'
@@ -34,15 +29,6 @@ import {
 } from './query-job-types.js'
 import { acquireMaintenanceWork } from './maintenance-lifecycle.js'
 import { registerMessageReservationSource } from './message-reservations.js'
-
-const TOOL_STATUS_MESSAGES: Record<string, string> = {
-  WebSearch: 'Searching web...',
-  WebFetch: 'Reading page...',
-  Read: 'Analyzing photo...',
-  search_meetings: 'Searching meetings...',
-  search_memories: 'Searching memory...',
-  read_meeting: 'Reading meeting...',
-}
 
 export class QueryJobAdmissionPreparationError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
@@ -112,20 +98,14 @@ export async function preparePublicDurableQueryAdmission(raw: unknown): Promise<
   }
 }
 
-function providerFor(model: ModelPreference): 'claude' | 'codex' | 'cursor' | 'ollama' {
-  if (isOllamaModel(model)) return 'ollama'
-  if (isCursorModel(model)) return 'cursor'
-  return isCodexModel(model) ? 'codex' : 'claude'
+function providerFor(_model: ModelPreference | undefined): 'hermes' {
+  return 'hermes'
 }
 
 /** The origin label as it travels on the display bus and the message views:
  * FLATTENED (`origin: 'routine', originId: 'morning-brief'`) so every client
  * parses one shape, and identical on `start`, `done` and `error`. Spread LAST
  * into each event so no provider metadata key can overwrite it. */
-function originStamp(request: QueryJobRequest): { origin?: NonNullable<QueryJobRequest['origin']>['kind']; originId?: string } {
-  return request.origin ? { origin: request.origin.kind, originId: request.origin.id } : {}
-}
-
 /** Project the authoritative terminal journal into the derived conversation
  * cache. Journaled request/response text always wins over bridge-written
  * partial rows; validated media refs may be merged because output media can
@@ -178,105 +158,33 @@ export async function projectPublicConversationTerminal(
   flushConversationToDisk()
 }
 
-const runner: QueryJobRunner = async ({ jobId, turnId, request, signal, callbacks }) => {
-  // Resolve ids again at execution time. This closes the admission/execution
-  // TOCTOU window without ever putting paths or bytes in the journal.
+const runner: QueryJobRunner = async (context) => {
+  const { request, callbacks } = context
   const resolvedAttachments = await resolveQueryAttachments({
     attachmentIds: request.attachmentIds,
     clientQueueItemId: request.clientQueueItemId,
     sessionId: request.sessionId,
   })
-  const imageInputs = resolvedAttachments.inputs.length > 0 ? resolvedAttachments.inputs : undefined
-  const validModel = normalizeModelPreference(request.model)
-  const validEffort = normalizeEffortPreference(request.effort)
-  let activeModel = validModel
-
-  await callModelStreaming(
-    request.query,
-    request.sessionId,
-    {
-      onStart: async (model, sessionId, cliSessionId, metadata) => {
-        activeModel = model
-        const linkage = {
-          provider: providerFor(model),
-          resolvedModel: model,
-          cliSessionId,
-          claudeRunId: metadata?.claudeRunId,
-          codexRunId: metadata?.codexRunId,
-          codexThreadId: metadata?.codexThreadId,
-          cursorRunId: metadata?.cursorRunId,
-          ollamaRunId: metadata?.ollamaRunId,
-        } as const
-        await callbacks.onStart({ sessionId, ...linkage })
-        emitDisplay({ type: 'start', data: {
-          jobId,
-          clientJobId: request.clientJobId,
-          generation: request.generation,
-          turnId,
-          messageEra: request.messageEra,
-          globalMsgNum: request.globalMsgNum,
-          model,
-          sessionId,
-          cliSessionId,
-          ...metadata,
-          ...originStamp(request),
-        } })
-      },
-      onProviderProcess: metadata => callbacks.onProviderProcess({
-        provider: metadata.provider,
-        ...(activeModel ? { resolvedModel: activeModel } : {}),
-        ...(metadata.provider === 'claude'
-          ? { claudeRunId: metadata.runId }
-          : metadata.provider === 'cursor'
-            ? { cursorRunId: metadata.runId }
-            : metadata.provider === 'ollama'
-              ? { ollamaRunId: metadata.runId }
-              : { codexRunId: metadata.runId }),
-      }),
-      onChunk: text => { callbacks.onChunk(text) },
-      onToolStatus: toolName => {
-        const message = request.activityToolMode === 'off'
-          ? 'Processing...'
-          : TOOL_STATUS_MESSAGES[toolName] ?? (/\s|\.{3}$/.test(toolName) ? toolName : `Using ${toolName}...`)
-        callbacks.onToolStatus(message)
-      },
-      ...(request.activityToolMode === 'preview' ? {
-        onActivityLine: (line: { kind: 'input' | 'output'; text: string }) => callbacks.onActivityLine(line),
-      } : {}),
-      onAnswerReady: text => callbacks.onAnswerReady(text, {
-        ...(activeModel ? { provider: providerFor(activeModel), resolvedModel: activeModel } : {}),
-      }),
-      onDone: async (fullText, model, cliSessionId, metadata) => {
+  await runHermesPlatformTurn({
+    ...context,
+    callbacks: {
+      ...callbacks,
+      onDone: async (completion) => {
         const attachments = mergeMediaAttachmentRefs(
           resolvedAttachments.refs,
-          metadata?.outputAttachments,
+          Array.isArray(completion.attachments) ? completion.attachments as never : undefined,
         )
-        // Acquire before the durable terminal callback can release the main
-        // query lease. Attachment association is a post-terminal write and
-        // must not create a zero-count maintenance proof gap.
         const attachmentLease = resolvedAttachments.ids.length > 0
           ? acquireMaintenanceWork('query_attachment_write', { allowDuringDrain: true })
           : undefined
-        const linkage = {
-          provider: providerFor(model),
-          resolvedModel: model,
-          cliSessionId,
-          claudeRunId: metadata?.claudeRunId,
-          codexRunId: metadata?.codexRunId,
-          codexThreadId: metadata?.codexThreadId,
-          cursorRunId: metadata?.cursorRunId,
-          ollamaRunId: metadata?.ollamaRunId,
-        } as const
-        // Publish compatibility completion only after the durable terminal is
-        // fsynced. Display subscribers can disappear without owning this job.
         try {
           const terminalOwned = await callbacks.onDone({
-            text: fullText,
+            ...completion,
             attachments,
-            outputImageStats: metadata?.outputImageStats,
-            ...linkage,
+            provider: 'hermes',
+            resolvedModel: completion.resolvedModel ?? providerFor(normalizeModelPreference(request.model)),
           })
-          if (!terminalOwned) return
+          if (!terminalOwned) return false
           if (resolvedAttachments.ids.length > 0) {
             await getMediaStore().associate(resolvedAttachments.ids, {
               sessionId: request.sessionId,
@@ -284,65 +192,13 @@ const runner: QueryJobRunner = async ({ jobId, turnId, request, signal, callback
               messageEra: request.messageEra,
             }).catch(error => console.error('[query-jobs] attachment association failed:', error))
           }
-          const { outputAttachments: _outputAttachments, ...runMetadata } = metadata ?? {}
-          emitDisplay({ type: 'done', data: {
-            jobId,
-            clientJobId: request.clientJobId,
-            generation: request.generation,
-            turnId,
-            messageEra: request.messageEra,
-            globalMsgNum: request.globalMsgNum,
-            text: fullText,
-            sessionId: request.sessionId,
-            model,
-            cliSessionId,
-            ...runMetadata,
-            ...(attachments.length > 0 ? { attachments } : {}),
-            ...originStamp(request),
-          } })
+          return true
         } finally {
           attachmentLease?.release()
         }
       },
-      onError: async error => {
-        const terminalOwned = await callbacks.onError(error)
-        if (!terminalOwned) return
-        emitDisplay({ type: 'error', data: {
-          jobId,
-          clientJobId: request.clientJobId,
-          generation: request.generation,
-          turnId,
-          messageEra: request.messageEra,
-          globalMsgNum: request.globalMsgNum,
-          ...originStamp(request),
-          error,
-        } })
-      },
     },
-    validModel,
-    imageInputs,
-    request.reference,
-    request.globalMsgNum,
-    {
-      abortSignal: signal,
-      effort: validEffort,
-      // Glasses Settings default is Agent. Explicit ask stays ask; omit → agent
-      // for Cursor so legacy clients aren't stuck in Ask when durable is off.
-      ...(validModel && isCursorModel(validModel)
-        ? {
-            cursorExecutionMode: (
-              request.cursorExecutionMode === 'ask' ? 'ask' : 'agent'
-            ) as CursorExecutionMode,
-          }
-        : {}),
-      clientJobId: request.clientJobId,
-      generation: request.generation,
-      requestAttachments: resolvedAttachments.refs,
-      attachmentPromptBlock: resolvedAttachments.promptBlock,
-      sessionLockHeld: true,
-      ...(request.dispatch ? { dispatch: request.dispatch } : {}),
-    },
-  )
+  })
 }
 
 const configuredRoot = process.env.COS_QUERY_JOB_DIR?.trim()

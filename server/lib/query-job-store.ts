@@ -576,11 +576,11 @@ export class QueryJobStore {
   }
 
   private applyLinkage(snapshot: QueryJobSnapshot, raw: Record<string, unknown>): void {
-    const provider = raw.provider === 'claude' || raw.provider === 'codex' || raw.provider === 'cursor' || raw.provider === 'ollama'
+    const provider = raw.provider === 'claude' || raw.provider === 'codex' || raw.provider === 'cursor' || raw.provider === 'ollama' || raw.provider === 'hermes'
       ? raw.provider
       : undefined
     if (provider) snapshot.provider = provider
-    const fields = ['resolvedModel', 'cliSessionId', 'claudeRunId', 'codexRunId', 'codexThreadId', 'cursorRunId', 'ollamaRunId'] as const
+    const fields = ['resolvedModel', 'cliSessionId', 'claudeRunId', 'codexRunId', 'codexThreadId', 'cursorRunId', 'ollamaRunId', 'hermesRunId'] as const
     for (const field of fields) {
       const value = safeOptional(raw[field])
       if (value) snapshot[field] = value
@@ -923,7 +923,7 @@ export class QueryJobStore {
       // query-job-runtime stamped it, but this sanitizer silently dropped it on
       // persist -- so phone acknowledgement of a live or replayed Ollama job could
       // never see its provider. Unknown providers still strip.
-      ...(linkage.provider === 'claude' || linkage.provider === 'codex' || linkage.provider === 'cursor' || linkage.provider === 'ollama'
+      ...(linkage.provider === 'claude' || linkage.provider === 'codex' || linkage.provider === 'cursor' || linkage.provider === 'ollama' || linkage.provider === 'hermes'
         ? { provider: linkage.provider }
         : {}),
       ...(safeOptional(linkage.resolvedModel, 64) ? { resolvedModel: safeOptional(linkage.resolvedModel, 64) } : {}),
@@ -933,6 +933,7 @@ export class QueryJobStore {
       ...(safeOptional(linkage.codexThreadId) ? { codexThreadId: safeOptional(linkage.codexThreadId) } : {}),
       ...(safeOptional(linkage.cursorRunId) ? { cursorRunId: safeOptional(linkage.cursorRunId) } : {}),
       ...(safeOptional(linkage.ollamaRunId) ? { ollamaRunId: safeOptional(linkage.ollamaRunId) } : {}),
+      ...(safeOptional(linkage.hermesRunId) ? { hermesRunId: safeOptional(linkage.hermesRunId) } : {}),
     }
   }
 

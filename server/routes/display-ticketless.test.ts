@@ -129,6 +129,10 @@ const FIXTURE_BY_TYPE: Record<DisplayEvent['type'], Record<string, unknown>> = {
   error: { error: 'CANARY_ERROR' },
   recording_start: { sessionId: 'CANARY_START_SESSION', title: 'CANARY_START_TITLE' },
   recording_stop: { sessionId: 'CANARY_STOP_SESSION', filename: 'CANARY_STOP_FILE.md', durationMin: 1, domain: 'x' },
+  hermes_message: { text: 'CANARY_HERMES', inboxId: 'inb_1', profile: 'eve', kind: 'cron' },
+  approval_required: { requestId: 'CANARY_APPROVAL', description: 'CANARY_APPROVAL_TEXT' },
+  approval_resolved: { requestId: 'CANARY_RESOLVED', choice: 'deny' },
+  agent_status: { profile: 'eve', status: 'working', jobId: 'CANARY_JOB' },
 }
 const ALLOWLISTED: ReadonlySet<DisplayEvent['type']> = new Set(['recording_stop'])
 const CONTENT_TYPES: Array<{ type: DisplayEvent['type']; data: Record<string, unknown> }> =

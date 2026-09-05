@@ -113,7 +113,7 @@ export interface QueryJobRequest {
 export const DISPATCH_ALLOWED_TOOLS = ['Read', 'Grep', 'Glob'] as const
 
 export interface QueryJobProviderLinkage {
-  provider?: 'claude' | 'codex' | 'cursor' | 'ollama'
+  provider?: 'claude' | 'codex' | 'cursor' | 'ollama' | 'hermes'
   resolvedModel?: string
   cliSessionId?: string
   claudeRunId?: string
@@ -121,6 +121,7 @@ export interface QueryJobProviderLinkage {
   codexThreadId?: string
   cursorRunId?: string
   ollamaRunId?: string
+  hermesRunId?: string
 }
 
 /** Path/id-free aggregate from output-image finalization. Values are bounded
