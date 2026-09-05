@@ -153,6 +153,22 @@ describe('QueryJobStore durable journal', () => {
     expect(replayed.ollamaRunId).toBe('local-run-1')
   })
 
+  it('persists a hermes linkage through the journal and a rehydrate', async () => {
+    const root = await tempRoot()
+    const clock = new Date('2026-09-05T16:00:00.000Z')
+    const priorBoot = new QueryJobStore({ root, bootId: 'boot-hermes', now: () => new Date(clock) })
+    const admitted = await priorBoot.admit(request(randomUUID()))
+    await priorBoot.markStarting(admitted.job.jobId)
+    await priorBoot.markRunning(admitted.job.jobId, { provider: 'hermes', resolvedModel: 'eve' })
+    await priorBoot.updateLinkage(admitted.job.jobId, { provider: 'hermes', hermesRunId: 'g2-job-1' })
+
+    const restarted = new QueryJobStore({ root, bootId: 'boot-hermes-2', now: () => new Date(clock) })
+    await restarted.init()
+    const replayed = await restarted.getSnapshot(admitted.job.jobId)
+    expect(replayed.provider).toBe('hermes')
+    expect(replayed.hermesRunId).toBe('g2-job-1')
+  })
+
   it('still strips an unknown provider on persist', async () => {
     const root = await tempRoot()
     const clock = new Date('2026-08-26T20:10:00.000Z')

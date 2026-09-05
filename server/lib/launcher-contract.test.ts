@@ -35,38 +35,25 @@ describe('public npx launcher install contract', () => {
     expect(launcher).toContain('npm_config_cache="$HOME/.cos-glasses/npm-cache" npx --yes @gotcos/glasses-server@latest')
   })
 
-  it('distinguishes Claude Desktop from the required terminal CLI', () => {
-    expect(launcher).toContain('Claude Desktop alone is not enough')
-    expect(launcher).toContain('npm install -g @anthropic-ai/claude-code')
-    expect(launcher).toContain('and finish sign-in')
+  it('probes Hermes instead of requiring a Cos CLI', () => {
+    expect(launcher).toContain('HERMES_PLUGIN_TOKEN')
+    expect(launcher).toContain('HERMES_API_URL')
+    expect(launcher).toContain('Hermes plugin token')
+    expect(launcher).not.toContain('No signed-in agent CLI is ready')
+    expect(launcher).not.toContain('Claude Desktop alone is not enough')
   })
 
-  it('checks provider authentication before claiming first-query readiness', () => {
-    expect(launcher).toContain("commandResult('claude auth status --json')")
-    expect(launcher).toContain("commandResult('codex login status')")
-    expect(launcher).toContain("execFileSync(binary, ['models']")
-    expect(launcher).toContain('No signed-in agent CLI is ready')
-    expect(launcher).toContain('claude auth login')
-    expect(launcher).toContain('agent login')
+  it('never exits when Hermes is unreachable', () => {
+    expect(launcher).toContain('Hermes gateway not reachable')
+    expect(launcher).toContain('Display, STT, and meetings still work')
   })
 
-  it('accepts a Cursor-only install only when both public model slots resolve', () => {
-    const temp = mkdtempSync(resolve(tmpdir(), 'cos-launcher-cursor-'))
+  it('prepare-only succeeds without Claude, Codex, or Cursor', () => {
+    const temp = mkdtempSync(resolve(tmpdir(), 'cos-launcher-hermes-'))
     const bin = resolve(temp, 'bin')
     const home = resolve(temp, 'home')
     mkdirSync(bin)
     mkdirSync(home)
-    const agent = resolve(bin, 'agent')
-    writeFileSync(agent, `#!/bin/sh
-if [ "$1" = "about" ]; then echo "Cursor Agent CLI Version 2026.07"; exit 0; fi
-if [ "$1" = "models" ]; then
-  echo "composer-2.5-fast - Composer 2.5 Fast"
-  echo "cursor-grok-4.5-high-fast - Grok 4.5 Fast"
-  exit 0
-fi
-exit 1
-`)
-    chmodSync(agent, 0o755)
 
     try {
       const result = spawnSync(process.execPath, [resolve(root, 'bin/cli.cjs'), '--prepare-only'], {
@@ -74,37 +61,8 @@ exit 1
         env: { ...process.env, HOME: home, PATH: `${bin}:/usr/bin:/bin` },
       })
       expect(result.status).toBe(0)
-      expect(result.stdout).toContain('Cursor Agent Cursor Agent CLI Version 2026.07')
-      expect(result.stdout).toContain('(Composer 2.5 / newest Grok high-fast)')
+      expect(result.stdout).toContain('Hermes')
       expect(result.stdout).toContain('Non-mutating readiness check complete')
-    } finally {
-      rmSync(temp, { recursive: true, force: true })
-    }
-  })
-
-  it('fails before startup when the only installed provider is signed out', () => {
-    const temp = mkdtempSync(resolve(tmpdir(), 'cos-launcher-auth-'))
-    const bin = resolve(temp, 'bin')
-    const home = resolve(temp, 'home')
-    mkdirSync(bin)
-    mkdirSync(home)
-    const claude = resolve(bin, 'claude')
-    writeFileSync(claude, `#!/bin/sh
-if [ "$1" = "--version" ]; then echo "2.1.215"; exit 0; fi
-if [ "$1" = "auth" ] && [ "$2" = "status" ]; then echo '{"loggedIn":false}'; exit 1; fi
-exit 1
-`)
-    chmodSync(claude, 0o755)
-
-    try {
-      const result = spawnSync(process.execPath, [resolve(root, 'bin/cli.cjs')], {
-        encoding: 'utf8',
-        env: { ...process.env, HOME: home, PATH: bin },
-      })
-      expect(result.status).toBe(1)
-      expect(result.stdout).toContain('installed — sign-in required')
-      expect(result.stdout).toContain('No signed-in agent CLI is ready')
-      expect(result.stdout).toContain('claude auth login')
     } finally {
       rmSync(temp, { recursive: true, force: true })
     }
@@ -155,7 +113,7 @@ exit 1
     }
   })
 
-  it('makes an explicit Kokoro Python override authoritative in readiness checks', () => {
+  it.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')('makes an explicit Kokoro Python override authoritative in readiness checks', () => {
     const temp = mkdtempSync(resolve(tmpdir(), 'cos-launcher-kokoro-python-'))
     const bin = resolve(temp, 'bin')
     const home = resolve(temp, 'home')

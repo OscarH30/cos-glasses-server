@@ -10,16 +10,19 @@ export type CodexModelPreference = 'codex-frontier' | 'codex-balanced'
 export type CursorModelPreference = 'cursor-grok' | 'cursor-composer'
 /** Local Ollama chat slot. Hidden unless the daemon answers on loopback. */
 export type OllamaModelPreference = 'ollama'
+/** Hermes Agent gateway profile slot. Exclusive chat path on this fork. */
+export type HermesModelPreference = 'hermes'
 /** Cursor Agent CLI execution posture for glasses queries. */
 export type CursorExecutionMode = 'ask' | 'agent'
-export type ModelPreference = ClaudeModelPreference | CodexModelPreference | CursorModelPreference | OllamaModelPreference
+export type ModelPreference = ClaudeModelPreference | CodexModelPreference | CursorModelPreference | OllamaModelPreference | HermesModelPreference
 
 /** Invalid/omitted → ask (safe for old clients that don't send a mode). */
 export function normalizeCursorExecutionMode(value: unknown): CursorExecutionMode {
   return value === 'agent' ? 'agent' : 'ask'
 }
 
-// Preserve the public server's established fast, broadly available default.
+// Legacy slot name kept for one-release phone compatibility. Runtime chat
+// always goes to Hermes regardless of this value.
 export const DEFAULT_MODEL = 'sonnet' as const
 export const CODEX_FRONTIER_MODEL: CodexModelPreference = 'codex-frontier'
 export const CODEX_BALANCED_MODEL: CodexModelPreference = 'codex-balanced'
@@ -28,6 +31,7 @@ export const CODEX_HIGH_MODEL: CodexModelPreference = CODEX_FRONTIER_MODEL
 export const CURSOR_GROK_MODEL: CursorModelPreference = 'cursor-grok'
 export const CURSOR_COMPOSER_MODEL: CursorModelPreference = 'cursor-composer'
 export const OLLAMA_MODEL: OllamaModelPreference = 'ollama'
+export const HERMES_MODEL: HermesModelPreference = 'hermes'
 // Existing 6.1–6.3 installs may pin the legacy codex-high slot. Frontier is its
 // migration target; Balanced remains auto-catalog even when this override is set.
 export const CODEX_MODEL_ID = process.env.COS_CODEX_MODEL?.trim() ?? ''
@@ -53,6 +57,7 @@ export const MODEL_OPTIONS: ModelPreference[] = [
   CURSOR_GROK_MODEL,
   CURSOR_COMPOSER_MODEL,
   OLLAMA_MODEL,
+  HERMES_MODEL,
 ]
 
 const MODEL_SET = new Set<ModelPreference>([
@@ -65,6 +70,7 @@ const MODEL_SET = new Set<ModelPreference>([
   CURSOR_GROK_MODEL,
   CURSOR_COMPOSER_MODEL,
   OLLAMA_MODEL,
+  HERMES_MODEL,
 ])
 
 // Bare Claude tier aliases resolve to the newest model in that tier at spawn.
@@ -158,6 +164,10 @@ export function isOllamaModel(model: ModelPreference): model is OllamaModelPrefe
   return model === OLLAMA_MODEL
 }
 
+export function isHermesModel(model: ModelPreference): model is HermesModelPreference {
+  return model === HERMES_MODEL
+}
+
 /** Picker families. Cursor and Ollama stay hidden until their local probe is ready. */
 export function visibleModelOptions(
   cursorAvailable: boolean,
@@ -218,6 +228,7 @@ export function modelLabel(model: ModelPreference): string {
     case 'cursor-grok': return runtimeCursorLabels[model] ?? 'Grok Fast'
     case 'cursor-composer': return runtimeCursorLabels[model] ?? 'Composer 2.5 Fast'
     case 'ollama': return 'Ollama'
+    case 'hermes': return 'Hermes'
     case 'opus':
     default:
       return 'Opus'
@@ -234,6 +245,7 @@ export function modelShortLabel(model: ModelPreference): string {
     case 'cursor-grok': return 'Grok'
     case 'cursor-composer': return 'Composer'
     case 'ollama': return 'Ollama'
+    case 'hermes': return 'Hermes'
     case 'opus':
     default:
       return 'Opus'
@@ -250,6 +262,7 @@ export function modelButtonLabel(model: ModelPreference): string {
     case 'cursor-grok': return 'GROK'
     case 'cursor-composer': return 'CMP'
     case 'ollama': return 'OLLAMA'
+    case 'hermes': return 'HRM'
     case 'opus':
     default:
       return 'OPUS'
@@ -266,6 +279,7 @@ export function modelTag(model: ModelPreference): string {
     case 'cursor-grok': return 'GK'
     case 'cursor-composer': return 'C2'
     case 'ollama': return 'OL'
+    case 'hermes': return 'E'
     case 'opus':
     default:
       return 'O'

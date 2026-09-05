@@ -52,6 +52,11 @@ export default defineConfig({
     env: {
       COS_DATA_DIR: isolatedDataDir,
       COS_PROFILE_PATH: join(isolatedDataDir, '.cos-profile.json'),
+      HERMES_PLUGIN_TOKEN: 'test-hermes-plugin-token',
+      HERMES_API_URL: 'http://127.0.0.1:0',
+      HERMES_DEFAULT_PROFILE: 'eve',
+      HERMES_TURN_TIMEOUT_MS: '2000',
+      HERMES_STUB_REPLY: 'Hermes stub reply.',
     },
   },
 })

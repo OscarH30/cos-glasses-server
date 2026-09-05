@@ -191,7 +191,34 @@ if (nodeMajor < 20 || (nodeMajor === 20 && nodeMinor < 11)) {
 }
 console.log(green('  ✓') + ` Node.js ${process.versions.node}`)
 
-// Step 2: agent CLI detection — at least one supported, signed-in CLI is required.
+// Step 2: Hermes reachability. Display, STT, and meetings still work if the
+// gateway is down — warn, never exit.
+function hermesReachable() {
+  const url = (process.env.HERMES_API_URL || '').replace(/\/$/, '')
+  const token = (process.env.HERMES_PLUGIN_TOKEN || '').trim()
+  if (!token) {
+    console.log(yellow('  ⚠') + ' Hermes plugin token not set ' + dim('— server will mint one at boot'))
+  } else {
+    console.log(green('  ✓') + ' Hermes plugin token present')
+  }
+  if (!url) {
+    console.log(yellow('  ⚠') + ' HERMES_API_URL unset ' + dim('— Even AI passthrough disabled; g2 platform still works'))
+    return
+  }
+  try {
+    execSync(`curl -fsS --max-time 2 ${JSON.stringify(url + '/health')}`, {
+      shell: '/bin/sh',
+      stdio: 'pipe',
+      timeout: 4000,
+    })
+    console.log(green('  ✓') + ` Hermes gateway at ${url}`)
+  } catch {
+    console.log(yellow('  ⚠') + ` Hermes gateway not reachable at ${url}`)
+    console.log('    Start it with: ' + bold('hermes -p eve gateway'))
+  }
+}
+hermesReachable()
+
 function getCliVersion(command, versionArg = '--version') {
   try {
     return execSync(`${command} ${versionArg} 2>&1`, { shell: '/bin/sh', stdio: 'pipe', timeout: 5000 }).toString().trim()
@@ -294,72 +321,6 @@ function cursorCliState() {
     }
   }
 }
-const claudeVersion = getCliVersion('claude')
-const codexVersion = getCliVersion('codex')
-const claudeAuth = claudeVersion ? claudeAuthState() : null
-const codexAuth = codexVersion ? codexAuthState() : null
-const cursor = cursorCliState()
-if (claudeVersion) {
-  if (claudeAuth === 'signed-out') {
-    console.log(yellow('  ⚠') + ` Claude Code ${claudeVersion} installed — sign-in required`)
-    console.log('    Run: ' + bold('claude auth login'))
-  } else if (claudeAuth === 'unknown') {
-    console.log(yellow('  ⚠') + ` Claude Code ${claudeVersion} installed — sign-in status unavailable`)
-    console.log('    Verify: ' + bold('claude auth status'))
-  } else {
-    console.log(green('  ✓') + ` Claude Code ${claudeVersion} ` + dim('(Opus / Fable / Sonnet)'))
-  }
-} else {
-  console.log(yellow('  ⚠') + ' Claude Code CLI not found ' + dim('— Opus/Fable/Sonnet unavailable'))
-  console.log('    Claude Desktop does not install the terminal CLI.')
-  console.log('    Install (no sudo): ' + bold('npm install -g @anthropic-ai/claude-code'))
-  console.log('    Then run:          ' + bold('claude') + ' and finish sign-in')
-}
-if (codexVersion) {
-  if (codexAuth === 'signed-out') {
-    console.log(yellow('  ⚠') + ` Codex CLI ${normalizeCodexVersion(codexVersion)} installed — sign-in required`)
-    console.log('    Run: ' + bold('codex login'))
-  } else if (codexAuth === 'unknown') {
-    console.log(yellow('  ⚠') + ` Codex CLI ${normalizeCodexVersion(codexVersion)} installed — sign-in status unavailable`)
-    console.log('    Verify: ' + bold('codex login status'))
-  } else {
-    console.log(green('  ✓') + ` Codex CLI ${normalizeCodexVersion(codexVersion)} ` + dim('(GPT Frontier / Balanced)'))
-  }
-} else {
-  console.log(yellow('  ⚠') + ' Codex CLI not found ' + dim('— GPT Frontier/Balanced unavailable'))
-}
-if (cursor.binary) {
-  if (cursor.auth === 'ready') {
-    console.log(green('  ✓') + ` Cursor Agent ${cursor.version} ` + dim('(Composer 2.5 / newest Grok high-fast)'))
-  } else if (cursor.auth === 'signed-out') {
-    console.log(yellow('  ⚠') + ` Cursor Agent ${cursor.version} installed — sign-in required`)
-    console.log('    Run: ' + bold('agent login'))
-  } else if (cursor.auth === 'models-unresolved') {
-    console.log(yellow('  ⚠') + ` Cursor Agent ${cursor.version} installed — required models unresolved`)
-    console.log('    Verify: ' + bold('agent models') + ' includes Composer 2.5 Fast and a cursor-grok-*-high-fast id')
-  } else {
-    console.log(yellow('  ⚠') + ` Cursor Agent ${cursor.version} installed — readiness unavailable`)
-    console.log('    Verify: ' + bold('agent models'))
-  }
-} else {
-  console.log(yellow('  ⚠') + ' Cursor Agent CLI not found ' + dim('— Composer/Grok unavailable'))
-}
-const hasUsableAgent = (claudeVersion && claudeAuth !== 'signed-out')
-  || (codexVersion && codexAuth !== 'signed-out')
-  || cursor.auth === 'ready'
-if (!hasUsableAgent) {
-  console.log('')
-  console.log(red('  ✗ No signed-in agent CLI is ready'))
-  console.log('    Claude Desktop alone is not enough; COS needs a signed-in terminal CLI.')
-  console.log('    Install Claude Code (no sudo): ' + bold('npm install -g @anthropic-ai/claude-code'))
-  console.log('    Then run:                       ' + bold('claude auth login'))
-  console.log('    or Codex CLI:        ' + bold('https://developers.openai.com/codex/') + ' then ' + bold('codex login'))
-  console.log('    or Cursor Agent CLI: run ' + bold('agent login') + ', then verify ' + bold('agent models'))
-  console.log('    Setup help:          ' + bold('https://www.gotcos.com/wizard/'))
-  console.log('')
-  process.exit(1)
-}
-
 // Step 3: resolve the dependency npm already installed. With `npx`, dependency
 // packages are siblings in npm's temporary node_modules tree rather than under
 // PKG_ROOT/node_modules. Running a second `npm install` from inside that cache

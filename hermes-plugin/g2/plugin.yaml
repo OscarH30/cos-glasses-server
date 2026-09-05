@@ -1,0 +1,31 @@
+name: g2-platform
+label: Even G2
+kind: platform
+version: 1.0.0
+description: >
+  Even G2 glasses gateway adapter for Hermes Agent. Streams inbound
+  glasses turns from cos-glasses-server over loopback SSE and delivers
+  replies, cron output, and approval prompts back to the HUD inbox.
+author: OscarH30
+requires_env:
+  - name: G2_SERVER_URL
+    description: "cos-glasses-server base URL (default http://127.0.0.1:3141)"
+    prompt: "G2 server URL"
+    password: false
+  - name: G2_PLUGIN_TOKEN
+    description: "Shared secret minted by the glasses server (HERMES_PLUGIN_TOKEN)"
+    prompt: "G2 plugin token"
+    password: true
+optional_env:
+  - name: G2_HOME_CHANNEL
+    description: "Default chat id for cron delivery (default g2)"
+    prompt: "G2 home channel"
+    password: false
+  - name: G2_ALLOWED_USERS
+    description: "Allowed G2 user ids (default g2)"
+    prompt: "Allowed G2 users"
+    password: false
+  - name: G2_ALLOW_ALL_USERS
+    description: "Allow any G2 chat id (dev only)"
+    prompt: "Allow all G2 users?"
+    password: false

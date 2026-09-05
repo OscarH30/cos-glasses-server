@@ -51,7 +51,6 @@ import { G2_LENS_VARIANT_CAPABILITY } from '../lib/media-store.js'
 import { MEDIA_CHUNKED_UPLOAD_ENABLED } from './media.js'
 import { durableQueryJobsCapability } from '../lib/query-job-feature.js'
 import { getQueryJobRuntimeHealth } from '../lib/query-job-runtime.js'
-import { getMorningBriefScheduler } from '../lib/morning-brief-runtime.js'
 import { getTranscriptionPolicySnapshot } from '../lib/transcription-policy.js'
 import { CLI_DEBUG_CAPABILITY } from '../lib/cli-debug-view.js'
 import { managedRuntimeCapability, managedServerVersion } from '../lib/managed-runtime.js'
@@ -70,6 +69,7 @@ import { getProgressiveHqSnapshot } from '../lib/meeting-batch-transcribe.js'
 import { getMeetingFinalizationSnapshot } from '../lib/meeting-finalization-jobs.js'
 import { resolveMeetingLibrary } from '../lib/cos-operations-meetings.js'
 import { videoUploadV2Capability } from '../lib/video-upload-v2.js'
+import { hermesHealthSnapshot } from '../lib/hermes/runtime.js'
 import { MAX_MODEL_IMAGE_INPUTS } from '../lib/query-attachments.js'
 // Continue-vs-Fork is decided before a thread is named, so it cannot be
 // discovered from the per-thread attachability probe. ABSENT MEANS DISABLED on
@@ -115,14 +115,6 @@ function durableQueryJobStatus() {
   }
 }
 
-async function morningBriefCapabilityOrNull() {
-  try {
-    return await getMorningBriefScheduler().capability()
-  } catch {
-    return null
-  }
-}
-
 healthRouter.get('/health', async (_req, res) => {
   const [, staticProbes] = await Promise.all([
     refreshLocalTtsHealth(),
@@ -130,7 +122,7 @@ healthRouter.get('/health', async (_req, res) => {
   ])
   const checks: Record<string, string | number | boolean> = {
     status: 'ok',
-    mode: COS_MODE ? 'cos' : 'standalone',
+    mode: 'hermes',
     server: 'ok',
     python: staticProbes.python,
     claude: staticProbes.claude,
@@ -212,13 +204,6 @@ healthRouter.get('/health', async (_req, res) => {
   // diverged, so a constant in both is guaranteed to drift. Absent means an
   // older server, and the client falls back to single-shot.
   const mediaLimits = await getMediaLimits({ chunkedUploadEnabled: MEDIA_CHUNKED_UPLOAD_ENABLED })
-  // Public on purpose: a settings screen decides whether to show the Morning
-  // brief card from health, before it holds a token. Times and gate only —
-  // no prompt, no session or job ids. Health must never 500 because of the
-  // brief, so BOTH a synchronous construction failure and a rejected status
-  // read collapse to "capability absent" (health-query-jobs.test mocks the
-  // conversation store to one export, which is exactly such a failure).
-  const morningBrief = await morningBriefCapabilityOrNull()
   const features = {
     claude: claudeAvailable,
     codex: codexAvailable,
@@ -236,9 +221,7 @@ healthRouter.get('/health', async (_req, res) => {
     g2LensVariant: G2_LENS_VARIANT_CAPABILITY,
     durableQueryJobs: durableJobs.enabled,
     durableQueryJobsProtocol: durableJobs.protocolVersion,
-    // Static: this build carries the scheduler. The live schedule is under
-    // capabilities.morningBrief and may be absent while the runtime boots.
-    morningBrief: true,
+    morningBrief: false,
     localFirstMeetings: localFirstMeetings !== null,
     transcriptionPolicy: transcription.mode,
     liveCues: liveCues.available,
@@ -364,6 +347,7 @@ healthRouter.get('/health', async (_req, res) => {
       ready: ollama_models.ready,
       model: ollama_models.model,
     },
+    hermes: hermesHealthSnapshot(),
     meeting_sync,
     meeting_library: {
       layout: meetingLibrary.layout,
@@ -423,10 +407,8 @@ healthRouter.get('/health', async (_req, res) => {
         finalization: getMeetingFinalizationSnapshot(),
       },
       ...(localFirstMeetings ? { localFirstMeetings } : {}),
-      ...(morningBrief ? { morningBrief } : {}),
-      tasks: {
-        gate: pythonBridgeAvailable() ? 'ready' : 'disabled',
-      },
+      morningBrief: { retired: true, replacement: 'hermes_cron' },
+      tasks: { retired: true, replacement: 'hermes_cron' },
     },
     // /api/health is intentionally unauthenticated for setup diagnostics.
     // Publish capability only; job counts, retention identities, subscriber

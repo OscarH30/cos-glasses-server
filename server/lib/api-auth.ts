@@ -41,10 +41,36 @@ export function isPublicApiRequest(method: string, path: string): boolean {
     || DISPLAY_STREAM_CAPABILITY_PATH.test(path)
 }
 
+function isLoopbackRequest(req: { ip?: string; socket?: { remoteAddress?: string } }): boolean {
+  const ip = (req.ip || req.socket?.remoteAddress || '').replace(/^::ffff:/, '')
+  return ip === '127.0.0.1' || ip === '::1' || ip.startsWith('127.')
+}
+
+/** Loopback Hermes plugin may fetch attached photos with its own bearer. */
+function isHermesPluginMediaRead(req: {
+  method: string
+  path: string
+  query?: Record<string, unknown>
+  ip?: string
+  socket?: { remoteAddress?: string }
+  headers: Record<string, unknown>
+}): boolean {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false
+  if (req.query?.plugin !== '1') return false
+  if (!/^\/media\/[^/]+\/content$/.test(req.path)) return false
+  if (!isLoopbackRequest(req)) return false
+  const expected = (process.env.HERMES_PLUGIN_TOKEN || '').trim()
+  if (!expected) return false
+  const header = req.headers.authorization
+  const token = typeof header === 'string' && header.startsWith('Bearer ') ? header.slice(7) : ''
+  return timingSafeTokenEqual(token, expected)
+}
+
 /** Global /api authentication boundary. Mount before all body parsers. */
 export function requireApiToken(apiToken: string): RequestHandler {
   return (req, res, next) => {
     if (isPublicApiRequest(req.method, req.path)) return next()
+    if (isHermesPluginMediaRead(req)) return next()
     if (!timingSafeTokenEqual(req.headers['x-cos-token'], apiToken)) {
       return res.status(401).json({
         error: 'unauthorized',

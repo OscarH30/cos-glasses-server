@@ -10,7 +10,6 @@ import { createServer as createHttpServer } from 'node:http'
 import { readFileSync, existsSync } from 'node:fs'
 import { networkInterfaces, homedir } from 'node:os'
 import { join } from 'node:path'
-import { execSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { healthRouter } from './routes/health.js'
 import { diagRouter } from './routes/diag.js'
@@ -42,6 +41,8 @@ import { transcribeStreamRouter } from './routes/transcribe-stream.js'
 import { meetingRouter, resumeMeetingFinalizationJobs } from './routes/meeting.js'
 import { meetingsRouter } from './routes/meetings.js'
 import { openaiCompatRouter } from './routes/openai-compat.js'
+import { hermesPhoneRouter, hermesPluginRouter } from './routes/hermes-platform.js'
+import { getHermesRuntime } from './lib/hermes/runtime.js'
 import { openaiKeyRouter } from './routes/openai-key.js'
 import { messageRefRouter } from './routes/message-ref.js'
 import { archiveRouter } from './routes/archive.js'
@@ -59,17 +60,11 @@ import { promptEditRouter } from './routes/prompt-edit.js'
 import { bookmarksRouter } from './routes/bookmarks.js'
 import { welcomeContextRouter } from './routes/welcome-context.js'
 import { liveCuesRouter } from './routes/live-cues.js'
-import { tasksRouter } from './routes/tasks.js'
+import { goneMorningBriefRouter, goneTasksRouter } from './routes/hermes-gone.js'
 import { memoryRouter } from './routes/memory.js'
 import { threadsRouter } from './routes/threads.js'
 import { shutdownLiveCues } from './lib/live-cues-engine.js'
 import { prewarmContext } from './lib/context-builder.js'
-import { preWarmCLI } from './lib/claude-bridge.js'
-import { getCodexRunConfig } from './lib/codex-run-ledger.js'
-import {
-  startCodexModelCatalogRefresh,
-  stopCodexModelCatalogRefresh,
-} from './lib/codex-model-catalog.js'
 import { startWhisperServer, stopWhisperServer } from './lib/whisper-local.js'
 import { startWhisperPreviewServer, stopWhisperPreviewServer } from './lib/whisper-preview.js'
 import { startLocalTtsServer, stopLocalTtsServer } from './lib/tts-local.js'
@@ -84,8 +79,6 @@ import { initializeServerInstanceId } from './lib/server-instance-id.js'
 import { appendPrivateEnvBlock, UnsafeUserConfigPathError } from './lib/secure-user-config.js'
 import { getTranscriptionProfileStatus } from './lib/profile.js'
 import { createQueryJobsRouter } from './routes/query-jobs.js'
-import { createMorningBriefRouter } from './routes/morning-brief.js'
-import { getMorningBriefScheduler, startMorningBriefScheduler, stopMorningBriefScheduler } from './lib/morning-brief-runtime.js'
 import {
   initQueryJobRuntime,
   preparePublicDurableQueryAdmission,
@@ -99,7 +92,6 @@ import {
 } from './lib/network-policy.js'
 import { requireApiToken } from './lib/api-auth.js'
 import { isManagedRuntime } from './lib/managed-runtime.js'
-import { reportClaudeExtraToolConfiguration } from './lib/claude-tool-access.js'
 import {
   acquireMaintenanceWork,
   maintenanceOperationCredentialsValid,
@@ -485,6 +477,8 @@ const forkThreadForRoute = (request: {
 })
 
 // API routes
+app.use('/hermes', hermesPluginRouter)
+app.use('/api', hermesPhoneRouter)
 app.use('/api', healthRouter)
 app.use('/api', diagRouter)
 app.use('/api', createQueryJobsRouter(queryJobCoordinator, {
@@ -493,7 +487,7 @@ app.use('/api', createQueryJobsRouter(queryJobCoordinator, {
 app.use('/api', queryRouter)
 // The scheduled start-of-day brief: settings, status, run-now. Same auth as
 // every other settings route; the brief itself is an ordinary durable job.
-app.use('/api', createMorningBriefRouter(getMorningBriefScheduler))
+app.use('/api', goneMorningBriefRouter)
 app.use('/api', providerProofRouter)
 app.use('/api', transcribeRouter)
 // Ported from cos-glasses-app in 6.24.0. The companion's Sessions tab has been
@@ -690,7 +684,7 @@ app.use('/api', promptEditRouter)
 app.use('/api', bookmarksRouter)
 app.use('/api', welcomeContextRouter)
 app.use('/api', liveCuesRouter)
-app.use('/api', tasksRouter)
+app.use('/api', goneTasksRouter)
 
 // OpenAI-compatible endpoint for the G2 Agent (ER "Add Agent")
 // Mounted at root — routes are /v1/chat/completions and /v1/models
@@ -720,7 +714,6 @@ async function gracefulShutdown(): Promise<void> {
   gracefulShutdownStarted = true
   const forceExit = setTimeout(() => process.exit(1), 8_000)
   forceExit.unref?.()
-  stopMorningBriefScheduler()
   try {
     await shutdownQueryJobRuntime('server_shutdown')
   } catch (error) {
@@ -736,7 +729,6 @@ async function gracefulShutdown(): Promise<void> {
     console.error('[live-cues] shutdown termination failed:', error)
   }
   try { logActiveSessionsOnShutdown() } catch { /* best-effort flush */ }
-  stopCodexModelCatalogRefresh()
   stopWhisperServer()
   await stopWhisperPreviewServer()
   stopLocalTtsServer()
@@ -812,7 +804,11 @@ listenRequiredServers(listeners).then(() => {
   }
   console.log(`[COS API] HTTP server running on http://${BIND_HOST}:${PORT}`)
   console.log(`[COS API] Server instance: ${serverInstanceId}`)
-  console.log(`[COS API] Mode: ${COS_MODE ? 'COS pipeline' : 'standalone'}`)
+  const hermes = getHermesRuntime()
+  console.log(`[COS API] Mode: Hermes platform (profile ${hermes.config.defaultProfile})`)
+  if (!hermes.config.pluginTokenPersisted) {
+    console.log('[COS API] Hermes plugin token minted for this process — set HERMES_PLUGIN_TOKEN in ~/.cos-glasses/.env')
+  }
 
   if (!startupAdmissionsOpen) {
     console.log('[COS API] Startup maintenance gate is closed — durable recovery waits for controller release')
@@ -848,22 +844,12 @@ listenRequiredServers(listeners).then(() => {
     console.log('')
   }
 
-  // Check Claude CLI availability. Codex-only installs remain fully valid.
-  let claudeAvailable = false
-  try {
-    execSync('claude --version', { timeout: 5000, stdio: 'pipe' })
-    claudeAvailable = true
-    console.log('[COS API] Claude Code CLI detected')
-  } catch {
-    console.warn('[COS API] Claude Code CLI not found — install from https://docs.anthropic.com/en/docs/claude-code/getting-started')
-    console.warn('[COS API]   Claude models unavailable; Codex models still work when Codex CLI is installed')
+  console.log(`[COS API] Hermes plugin token: ${hermes.config.pluginTokenPersisted ? 'persisted' : 'ephemeral'} · profiles ${hermes.profiles.list().map(p => p.name).join(', ') || hermes.config.defaultProfile}`)
+  if (hermes.config.apiUrl) {
+    console.log(`[COS API] Hermes API server: ${hermes.config.apiUrl}`)
+  } else {
+    console.log('[COS API] Hermes API server: unconfigured (Tier 3 Even AI passthrough disabled)')
   }
-
-  const codexConfig = getCodexRunConfig()
-  console.log(`[COS API] Codex mode: ${codexConfig.persistenceEnabled ? 'persistent' : 'ephemeral'} · ${codexConfig.reasoningEffort} · ${codexConfig.trustMode}`)
-  console.log(`[COS API] Codex models (${codexConfig.catalogSource}): ${codexConfig.availableModels.map(item => `${item.displayName}=${item.model}`).join(' · ')}`)
-  console.log(`[COS API] Codex workdir: ${codexConfig.cwd}`)
-  reportClaudeExtraToolConfiguration()
 
   // These services do not admit or mutate user work. They must start while a
   // managed successor is still behind the cross-boot gate so COS Control can
@@ -874,9 +860,6 @@ listenRequiredServers(listeners).then(() => {
     if (proofSafeServicesStarted) return
     proofSafeServicesStarted = true
 
-    // Refresh immediately and then periodically. The catalog retains the last
-    // known-good snapshot if Codex is temporarily unavailable.
-    startCodexModelCatalogRefresh()
     // Start local whisper-server (model stays in RAM for ~50ms transcription)
     const transcriptionProfile = getTranscriptionProfileStatus()
     if (transcriptionProfile.ignoredPlaceholderTerms > 0 || transcriptionProfile.ignoredPlaceholderCorrection) {
@@ -917,10 +900,6 @@ listenRequiredServers(listeners).then(() => {
       } else {
         console.log('[COS API] Durable query jobs: disabled by COS_DURABLE_QUERY_JOBS=0')
       }
-      // The morning brief rides the durable coordinator, so it starts only once
-      // that store is ready. Its own tick checks the durable-jobs switch and the
-      // maintenance gate, so starting it here is safe when either is off.
-      startMorningBriefScheduler()
     }).catch(error => {
       // The store remains degraded and rejects admission. Legacy /api/query is
       // still mounted, so the kill switch is an immediate rollback.
@@ -931,11 +910,6 @@ listenRequiredServers(listeners).then(() => {
       initSessionCache()
       // Pre-warm context cache so first query doesn't wait for the pipeline
       prewarmContext()
-    }
-
-    // Pre-warm Claude only when installed so Codex-only startup stays quiet.
-    if (claudeAvailable) {
-      preWarmCLI().catch(err => console.error('[startup] CLI pre-warm error:', err))
     }
 
     // Auto-snapshot active sessions every 5 min (survives restarts)

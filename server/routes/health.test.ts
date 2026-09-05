@@ -47,18 +47,15 @@ describe('health capability contract', () => {
 })
 
 describe('morning brief capability', () => {
-  it('advertises the scheduler and a public status summary with no prompt or ids', async () => {
+  it('advertises the Cos scheduler as retired in favor of Hermes cron', async () => {
     const response = await fetch(`${base}/api/health`)
     expect(response.status).toBe(200)
     const body = await response.json() as any
-    expect(body.features.morningBrief).toBe(true)
-    expect(body.capabilities.morningBrief).toMatchObject({ protocolVersion: 1, enabled: true, time: '07:00' })
-    expect(typeof body.capabilities.morningBrief.timezone).toBe('string')
-    expect(['ready', 'disabled', 'durable_jobs_off', 'admissions_closed']).toContain(body.capabilities.morningBrief.gate)
-    const keys = Object.keys(body.capabilities.morningBrief)
-    expect(keys).not.toContain('sessionId')
-    expect(keys).not.toContain('jobId')
-    expect(keys).not.toContain('prompt')
+    expect(body.features.morningBrief).toBe(false)
+    expect(body.capabilities.morningBrief).toEqual({ retired: true, replacement: 'hermes_cron' })
+    expect(body.capabilities.tasks).toEqual({ retired: true, replacement: 'hermes_cron' })
+    expect(body.mode).toBe('hermes')
+    expect(body.hermes).toMatchObject({ defaultProfile: 'eve' })
   }, 20_000)
 })
 

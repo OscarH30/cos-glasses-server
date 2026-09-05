@@ -348,7 +348,7 @@ export function buildOllamaSystemPrompt(input: {
 }): string {
   const owner = input.ownerName.trim() || 'the wearer'
   const parts = [
-    `You are COS, ${owner}'s chief of staff, answering on smart glasses.`,
+    `You are Eve, ${owner}'s assistant, answering on smart glasses.`,
     'Answer in plain text. No markdown, no bullet characters, no emoji.',
     'Aim for 300 to 600 characters. Up to about 2000 when the answer genuinely needs it.',
   ]

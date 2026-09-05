@@ -1,106 +1,62 @@
-# COS Glasses Server
+# Glasses server (OscarH30 / Hermes)
 
-Self-hosted AI heads-up display for **Even G2 smart glasses**. Runs on your Mac,
-talks to your local **Claude Code, Codex, or Cursor Agent** CLI, and pushes answers, voice
-transcription, and notes to the lens. Your data never leaves your machine, and no
-API key is pasted into the phone for chat.
+Self-hosted transport for **Eve on Even G2 smart glasses**. This fork talks to a
+local **Hermes Agent** gateway — not Claude, Codex, Cursor, or a fake Ollama.
+Persona, memory, sessions, cron, and approval policy live in Hermes. This
+process is pairing, display, durable jobs, speech/media, and the `g2` platform
+plugin.
+
+Oscar's daily driver is an **iPhone**. Launch the Eve Hub app and leave it;
+iOS keeps the WebView running while the phone is locked. Unsolicited briefs
+arrive as phone notifications (ntfy or Telegram) and the Even app mirrors them
+onto the lens even when another glasses app is in front. On the upgraded VPS,
+that path is ntfy + `g2-notify` + Hermes cron — see `docs/notifications.md`
+and `docs/ops-hermes.md`. The Hub contract is `docs/hud-api.md`.
+
+**Do not deploy this fork to the VPS until Oscar says go.** Live pairing stays
+on Tailscale (`100.87.43.24:3141`).
 
 ## Quick start
 
 ```bash
-npx --yes @gotcos/glasses-server@latest
+npm install
+# ~/.cos-glasses/.env
+# HERMES_PLUGIN_TOKEN=   # minted on first boot if unset
+# HERMES_API_URL=http://127.0.0.1:8643/v1
+# HERMES_API_KEY=
+# HERMES_DEFAULT_PROFILE=eve
+./scripts/install-hermes-plugin.sh eve
+hermes -p eve plugins enable g2-platform
+npm run start:server
 ```
 
-For the optional COS Control macOS menu bar app, run the same non-mutating
-readiness check it uses before guided installation:
-
-```bash
-npx --yes @gotcos/glasses-server@latest --prepare-only
-```
-
-COS Control then installs the same npm package as a launchd-managed runtime.
-The original foreground command remains supported and unchanged.
-
-Normal server start checks Node, finds your CLI, checks voice and image
-processing, writes `~/.cos-glasses/.env`, and starts the server on
-`0.0.0.0:3141`. Optional Whisper and Kokoro models are provisioned when their
-local services start; `--prepare-only` intentionally does not download or
-install optional models, write COS configuration, or start a listener. It may
-invoke an installed agent CLI's read-only version/auth probe, and that CLI may
-maintain its own user cache. On boot the server prints
-an **API token** — paste that into the COS Glasses app. Only one COS Glasses
-server may run on a Mac at a time; a second `npx` or source runner exits before
-opening ports or touching shared conversation/media state. Version 6.6.0 also
-gives that server a durable identity and boot-scoped display replay, allowing
-build 188+ to reconnect after a Tailscale, Wi-Fi, or process interruption
-without silently losing completed replies.
+On boot the server prints an **API token** — paste that into the Eve Hub app
+as `X-Cos-Token`. Copy `HERMES_PLUGIN_TOKEN` into the eve profile `.env` as
+`G2_PLUGIN_TOKEN`. Pairing stays on LAN/Tailscale; do not bind `:3141` to the
+public internet.
 
 ## Requirements
 
-- **Node.js 20.11+** — https://nodejs.org
-- **Claude Code CLI** (Opus/Fable/Sonnet). Claude Desktop alone does not install
-  the terminal command. Install it on one line with
-  `npm install -g @anthropic-ai/claude-code` (**never with `sudo`**), then run
-  `claude` and finish the browser sign-in
-  _or_ **Codex CLI** (GPT Frontier/Balanced) — https://developers.openai.com/codex/, then `codex login`
-- _Optional:_ **Cursor Agent CLI** for Composer 2.5 Fast and the newest Grok high-fast.
-  Ensure `agent` is on `PATH`, run `agent login`, and verify `agent models`
-  lists `composer-2.5-fast` and a `cursor-grok-*-high-fast` id. COS maps
-  `cursor-grok` to the newest high-fast it finds; it never silently substitutes
-  Claude or Codex.
-- **Even G2 glasses** + the **COS Glasses** app from the Even Hub
-- `brew install whisper-cpp` for free local voice (the launcher can download the model)
-- _Optional:_ `brew install python@3.12 ffmpeg poppler espeak-ng` for local Kokoro
-  spoken replies on Apple silicon (Python 3.11-3.12 is supported). `ffmpeg`
-  also enables photo/video attachments; `poppler` enables PDF text and page
-  previews. TXT, Markdown, CSV, and JSON attachments need no extra tool. Text
-  chat remains available without these optional dependencies.
-- _Optional:_ **Tailscale** so your phone reaches your Mac from anywhere
+- **Node.js 20.11+**
+- **Hermes Agent** gateway with the `eve` profile (SOUL + vault already there)
+- **Even G2 glasses** + the Eve Hub app (separate repo; contract in `docs/hud-api.md`)
+- **iPhone** with Even notification mirroring on (ntfy or Telegram for Tier 1)
+- `brew install whisper-cpp` for local voice
+- _Optional:_ Kokoro TTS, ffmpeg/poppler for media
+- _Optional:_ **Tailscale** so the phone reaches the server
 
-> No provider API key is needed for chat when using signed-in CLIs. Usage is
-> billed to the corresponding Claude, Codex, or Cursor subscription. Pick a
-> provider per query, or set a default with `COS_G2_DEFAULT_MODEL`
-> (`opus`|`fable`|`sonnet`|`codex-frontier`|`codex-balanced`|`cursor-grok`|`cursor-composer`|`ollama`).
-> Claude tier aliases and the two GPT slots resolve dynamically, so new model
-> releases do not require a new glasses package. GPT discovery refreshes every
-> 15 minutes and retains its last-known-good catalog through transient failures.
-> Cursor discovery also refreshes every 15 minutes and retains its last-known-good
-> catalog through transient failures.
-> Cursor **Agent** mode can edit files and run shell commands in the selected
-> workspace. Choose **Ask** mode when you want a non-editing answer; clients that
-> omit the execution mode default to Ask.
-> Existing `COS_CODEX_MODEL` / `COS_CODEX_REASONING_EFFORT` settings remain
-> supported on the migrated Frontier slot; leave them blank for auto-latest.
-> Codex runs **sandboxed read-only** by default. Set
-> `COS_CODEX_SANDBOX=workspace-write` for workdir writes + outbound network
-> (`sandbox_workspace_write.network_access=true` is passed by the managed server
-> and should also be set in `~/.codex/config.toml` for interactive Codex).
-> Local Ollama is a **fourth picker**, shown only when `ollama serve` answers
-> `GET http://127.0.0.1:11434/api/tags` with a pulled model. Direct
-> `POST /api/chat` — not Codex `--oss`. Optional pin: `COS_OLLAMA_MODEL`.
-> `COS_CODEX_EXTRA_ARGS` is a Codex CLI hatch, not the Ollama UX. See Configuration.
-> **Claude is the most permissive provider by default.** It runs with
-> `--dangerously-skip-permissions`, so a glasses query on the Claude/Opus path can
-> run shell commands and read, edit, and write files on this Mac without prompting
-> you. That is what makes the glasses useful for real work, and it has been the
-> behavior for some time — but as of 6.18.3 the model is also correctly *told* it
-> has those tools, so you will see it use them more readily than before.
-> Set `COS_CLAUDE_TRUST_MODE=allowlist` to remove Claude's permission bypass
-> and restrict it to COS's explicit per-query tool allowlist; undeclared tools
-> then fail closed without prompting. In allowlist mode the query keeps web
-> search/fetch and **read-only workspace access** (Read, Glob, Grep) — no
-> shell, no edits, no writes. Only the exact value `allowlist` restricts
-> anything — any other value logs a warning and stays trusted. Servers before
-> 6.41.0 denied ALL workspace reads in allowlist mode; if a hardened install
-> answers "I don't have access to your workspace files", update the server.
+> Chat does not use Claude, Codex, or Cursor CLIs. Hermes owns tools and
+> approval policy (`security.approval.transport: g2` with
+> `transport_fallback: builtin`). This server never composes Eve's system
+> prompt. See `docs/ops-hermes.md`.
 
 ## Connect your phone (the one gotcha)
 
 The glasses app runs on your iPhone and must reach this server on your Mac.
 
 1. The launcher binds `0.0.0.0` (all interfaces) for you.
-2. **Same WiFi (simplest):** find your Mac's LAN IP (System Settings > Wi-Fi > Details), and in the COS Glasses app enter `http://192.168.x.x:3141`.
-3. **From anywhere:** install **Tailscale** on the Mac + iPhone (same account), note the Mac's `100.x` address, and enter `http://100.x.x.x:3141`.
+2. **Same WiFi (simplest):** find the host LAN IP and in the Eve Hub app enter `http://192.168.x.x:3141`.
+3. **From anywhere:** Tailscale on the host + iPhone (same account), enter `http://100.x.x.x:3141`.
 4. Either way, paste the **API token** the server printed at boot.
 
 To restrict the server to localhost only, set `BIND_HOST=127.0.0.1` in `~/.cos-glasses/.env`.

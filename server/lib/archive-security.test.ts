@@ -1,28 +1,24 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+const completeOnce = vi.fn(async (_instructions: string, _input: string) => 'Safe archive title')
+
+vi.mock('./hermes/api-client.js', () => ({
+  completeOnce,
+}))
+
 describe('archive summary command safety', () => {
   let root = ''
-  let originalPath = ''
 
   beforeEach(() => {
-    vi.resetModules()
     root = mkdtempSync(join(tmpdir(), 'cos-archive-security-'))
-    originalPath = process.env.PATH ?? ''
     process.env.COS_DATA_DIR = join(root, 'data')
-
-    const fakeBin = join(root, 'bin')
-    mkdirSync(fakeBin, { recursive: true })
-    const fakeClaude = join(fakeBin, 'claude')
-    writeFileSync(fakeClaude, '#!/bin/sh\ncat >/dev/null\nprintf "Safe archive title\\n"\n', { mode: 0o700 })
-    chmodSync(fakeClaude, 0o700)
-    process.env.PATH = `${fakeBin}:${originalPath}`
+    completeOnce.mockClear()
   })
 
   afterEach(() => {
-    process.env.PATH = originalPath
     delete process.env.COS_DATA_DIR
     rmSync(root, { recursive: true, force: true })
   })
@@ -39,5 +35,8 @@ describe('archive summary command safety', () => {
 
     expect(title).toBe('Safe archive title')
     expect(existsSync(marker)).toBe(false)
+    expect(completeOnce).toHaveBeenCalled()
+    const input = completeOnce.mock.calls[0]?.[1] as string
+    expect(input).toContain(`$(touch ${marker})`)
   })
 })

@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
-  callModelStreaming: vi.fn(),
+  runHermesPlatformTurn: vi.fn(),
   emitDisplay: vi.fn(),
   resolveAttachments: vi.fn(),
   associate: vi.fn(),
@@ -16,8 +16,10 @@ const mocks = vi.hoisted(() => ({
   exchanges: [] as Array<Record<string, unknown>>,
 }))
 
+vi.mock('./hermes/turn-runner.js', () => ({
+  runHermesPlatformTurn: mocks.runHermesPlatformTurn,
+}))
 vi.mock('./model-router.js', () => ({
-  callModelStreaming: mocks.callModelStreaming,
   acquireModelSessionRunLock: vi.fn(async () => () => {}),
 }))
 vi.mock('./display-bus.js', () => ({ emitDisplay: mocks.emitDisplay }))
@@ -109,31 +111,30 @@ beforeEach(async () => {
     }
     return before - mocks.exchanges.length
   })
-  mocks.callModelStreaming.mockImplementation(async (
-    _query: string,
-    sessionId: string,
-    callbacks: Record<string, (...args: any[]) => unknown>,
-    _model: unknown,
-    _images: unknown,
-    _reference: unknown,
-    _globalMsgNum: unknown,
-    options: Record<string, unknown>,
-  ) => {
-    await callbacks.onStart?.('codex-frontier', sessionId, undefined, {})
-    await callbacks.onProviderProcess?.({
-      provider: 'codex',
-      runId: 'public-codex-run-1',
-      clientJobId: options.clientJobId,
-      generation: options.generation,
+  mocks.runHermesPlatformTurn.mockImplementation(async ({ request, callbacks, jobId, turnId }) => {
+    const origin = request.origin
+      ? { origin: request.origin.kind, originId: request.origin.id }
+      : {}
+    await callbacks.onStart?.({ sessionId: request.sessionId, provider: 'hermes', resolvedModel: 'eve' })
+    mocks.emitDisplay({
+      type: 'start',
+      data: { jobId, clientJobId: request.clientJobId, generation: request.generation, turnId, ...origin },
     })
+    await callbacks.onProviderProcess?.({ provider: 'hermes', hermesRunId: 'public-hermes-run-1' })
     callbacks.onChunk?.('durable ')
     await callbacks.onAnswerReady?.('durable answer')
-    await callbacks.onDone?.('durable answer', 'codex-frontier', undefined, {
-      codexRunId: 'public-codex-run-1',
-      outputAttachments: [outputRef],
+    await callbacks.onDone?.({
+      text: 'durable answer',
+      provider: 'hermes',
+      resolvedModel: 'eve',
+      hermesRunId: 'public-hermes-run-1',
+      attachments: [outputRef],
       outputImageStats: { published: 2, attached: 1, rejected: 1 },
     })
-    return sessionId
+    mocks.emitDisplay({
+      type: 'done',
+      data: { jobId, clientJobId: request.clientJobId, generation: request.generation, turnId, text: 'durable answer', ...origin },
+    })
   })
 })
 
@@ -176,9 +177,9 @@ describe('public durable query runtime', () => {
       status: 'completed',
       clientJobId,
       generation: 1,
-      provider: 'codex',
-      resolvedModel: 'codex-frontier',
-      codexRunId: 'public-codex-run-1',
+      provider: 'hermes',
+      resolvedModel: 'eve',
+      hermesRunId: 'public-hermes-run-1',
       response: 'durable answer',
       attachments: [requestRef, outputRef],
       outputImageStats: { published: 2, attached: 1, rejected: 1 },
@@ -198,11 +199,11 @@ describe('public durable query runtime', () => {
     }))
     expect(mocks.reconcileExchange).toHaveBeenCalledTimes(2)
     expect(mocks.flushConversation).toHaveBeenCalledTimes(1)
-    expect(mocks.callModelStreaming.mock.calls[0][7]).toMatchObject({
+    expect(mocks.runHermesPlatformTurn).toHaveBeenCalledTimes(1)
+    expect(mocks.runHermesPlatformTurn.mock.calls[0][0].request).toMatchObject({
       clientJobId,
       generation: 1,
     })
-    expect(mocks.callModelStreaming.mock.calls[0][7]).not.toHaveProperty('cursorExecutionMode')
     await runtime.shutdownQueryJobRuntime('test_shutdown')
   })
 
@@ -243,15 +244,22 @@ describe('public durable query runtime', () => {
   it('lets no provider metadata key overwrite the stamp (spread order on start and done)', async () => {
     // ModelRunMetadata declares no origin key today; this pins the order for
     // the day an untyped value flows through the wholesale spread.
-    mocks.callModelStreaming.mockImplementationOnce(async (
-      _query: string,
-      sessionId: string,
-      callbacks: Record<string, (...args: any[]) => unknown>,
-    ) => {
-      await callbacks.onStart?.('codex-frontier', sessionId, undefined, { origin: 'bogus', originId: 'nope' })
+    mocks.runHermesPlatformTurn.mockImplementationOnce(async ({ request, callbacks, jobId, turnId }) => {
+      const origin = request.origin
+        ? { origin: request.origin.kind, originId: request.origin.id }
+        : {}
+      await callbacks.onStart?.({ sessionId: request.sessionId, provider: 'hermes', resolvedModel: 'eve' })
+      mocks.emitDisplay({
+        type: 'start',
+        data: { jobId, clientJobId: request.clientJobId, generation: request.generation, turnId, ...origin },
+      })
       callbacks.onChunk?.('durable ')
       await callbacks.onAnswerReady?.('durable answer')
-      await callbacks.onDone?.('durable answer', 'codex-frontier', undefined, { origin: 'bogus', originId: 'nope' })
+      await callbacks.onDone?.({ text: 'durable answer', provider: 'hermes', resolvedModel: 'eve' })
+      mocks.emitDisplay({
+        type: 'done',
+        data: { jobId, clientJobId: request.clientJobId, generation: request.generation, turnId, text: 'durable answer', ...origin },
+      })
     })
     const runtime = await import('./query-job-runtime.js')
     await runtime.initQueryJobRuntime()
@@ -272,13 +280,16 @@ describe('public durable query runtime', () => {
   })
 
   it('carries the origin onto the error event too, spread after provider metadata', async () => {
-    mocks.callModelStreaming.mockImplementationOnce(async (
-      _query: string,
-      sessionId: string,
-      callbacks: Record<string, (...args: any[]) => unknown>,
-    ) => {
-      await callbacks.onStart?.('codex-frontier', sessionId, undefined, {})
+    mocks.runHermesPlatformTurn.mockImplementationOnce(async ({ request, callbacks, jobId, turnId }) => {
+      const origin = request.origin
+        ? { origin: request.origin.kind, originId: request.origin.id }
+        : {}
+      await callbacks.onStart?.({ sessionId: request.sessionId, provider: 'hermes', resolvedModel: 'eve' })
       await callbacks.onError?.('provider exploded')
+      mocks.emitDisplay({
+        type: 'error',
+        data: { jobId, clientJobId: request.clientJobId, generation: request.generation, turnId, error: 'provider exploded', ...origin },
+      })
     })
     const runtime = await import('./query-job-runtime.js')
     await runtime.initQueryJobRuntime()
@@ -310,7 +321,7 @@ describe('public durable query runtime', () => {
     await runtime.shutdownQueryJobRuntime('test_shutdown')
   })
 
-  it('defaults omitted Cursor mode to agent on durable jobs', async () => {
+  it('runs Cos model slots through Hermes', async () => {
     const runtime = await import('./query-job-runtime.js')
     await runtime.initQueryJobRuntime()
     const clientJobId = randomUUID()
@@ -323,14 +334,14 @@ describe('public durable query runtime', () => {
     })
     const admission = await runtime.queryJobCoordinator.submit(prepared)
     await waitForCompleted(() => runtime.queryJobCoordinator.getSnapshot(admission.job.jobId))
-    expect(mocks.callModelStreaming.mock.calls.at(-1)?.[7]).toMatchObject({
-      clientJobId,
-      cursorExecutionMode: 'agent',
+    expect(await runtime.queryJobCoordinator.getSnapshot(admission.job.jobId)).toMatchObject({
+      provider: 'hermes',
+      resolvedModel: 'eve',
     })
     await runtime.shutdownQueryJobRuntime('test_shutdown')
   })
 
-  it('forwards Cursor Agent mode into callModelStreaming options', async () => {
+  it('ignores Cursor Agent mode on the Hermes path', async () => {
     const runtime = await import('./query-job-runtime.js')
     await runtime.initQueryJobRuntime()
     const clientJobId = randomUUID()
@@ -344,12 +355,9 @@ describe('public durable query runtime', () => {
     })
     const admission = await runtime.queryJobCoordinator.submit(prepared)
     await waitForCompleted(() => runtime.queryJobCoordinator.getSnapshot(admission.job.jobId))
-    expect(mocks.callModelStreaming.mock.calls.at(-1)?.[7]).toMatchObject({
-      clientJobId,
-      cursorExecutionMode: 'agent',
+    expect(await runtime.queryJobCoordinator.getSnapshot(admission.job.jobId)).toMatchObject({
+      provider: 'hermes',
     })
-    const execution = await runtime.queryJobStore.getExecution(admission.job.jobId)
-    expect(execution.request.cursorExecutionMode).toBe('agent')
     await runtime.shutdownQueryJobRuntime('test_shutdown')
   })
 
@@ -423,7 +431,7 @@ describe('public durable query runtime', () => {
       provider: 'claude',
       claudeRunId: 'committed-run',
     })
-    expect(mocks.callModelStreaming).not.toHaveBeenCalled()
+    expect(mocks.runHermesPlatformTurn).not.toHaveBeenCalled()
     expect(mocks.exchanges).toEqual(expect.arrayContaining([
       expect.objectContaining({ role: 'user', content: 'finish my committed reply', clientJobId, generation: 1 }),
       expect.objectContaining({ role: 'assistant', content: 'committed before restart', clientJobId, generation: 1 }),
