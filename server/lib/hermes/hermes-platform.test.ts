@@ -34,6 +34,7 @@ describe('Hermes g2 platform protocol', () => {
   beforeEach(() => {
     process.env.HERMES_PLUGIN_TOKEN = TOKEN
     process.env.HERMES_DEFAULT_PROFILE = 'eve'
+    delete process.env.HERMES_STUB_REPLY
     resetHermesConfigForTests()
     resetHermesRuntimeForTests()
     __resetDisplayBusForTests()

@@ -45,7 +45,10 @@ export async function callHermesStreaming(
       correlationId,
       sessionId: sid,
     })
-    const result = await runtime.turns.wait(correlationId, runtime.config.turnTimeoutMs)
+    const waiting = runtime.turns.wait(correlationId, runtime.config.turnTimeoutMs)
+    const stubReply = process.env.HERMES_STUB_REPLY
+    if (stubReply) runtime.turns.complete(correlationId, { text: stubReply, kind: 'reply' })
+    const result = await waiting
     callbacks.onChunk(result.text)
     await callbacks.onDone(result.text, 'hermes' as never, undefined, { hermesRunId: correlationId } as never)
   } catch (error) {

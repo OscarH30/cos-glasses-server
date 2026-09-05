@@ -24,7 +24,7 @@ describe('model preferences', () => {
     expect(DEFAULT_MODEL).toBe('sonnet')
     expect(MODEL_OPTIONS).toEqual([
       'opus', 'fable', 'sonnet', 'codex-frontier', 'codex-balanced',
-      'cursor-grok', 'cursor-composer', 'ollama',
+      'cursor-grok', 'cursor-composer', 'ollama', 'hermes',
     ])
     expect(isClaudeModel('fable')).toBe(true)
     expect(isCodexModel('codex-frontier')).toBe(true)
@@ -36,7 +36,7 @@ describe('model preferences', () => {
     expect(modelLabel('cursor-composer')).toBe('Composer 2.5 Fast')
     expect(modelLabel('ollama')).toBe('Ollama')
     expect(visibleModelOptions(false, false)).toEqual([
-      'opus', 'fable', 'sonnet', 'codex-frontier', 'codex-balanced',
+      'opus', 'fable', 'sonnet', 'codex-frontier', 'codex-balanced', 'hermes',
     ])
     expect(visibleModelOptions(true, true)).toContain('ollama')
     expect(visibleModelOptions(true, true)).toContain('cursor-grok')

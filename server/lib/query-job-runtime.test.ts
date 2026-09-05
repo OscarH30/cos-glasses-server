@@ -111,8 +111,15 @@ beforeEach(async () => {
     }
     return before - mocks.exchanges.length
   })
-  mocks.runHermesPlatformTurn.mockImplementation(async ({ request, callbacks }) => {
+  mocks.runHermesPlatformTurn.mockImplementation(async ({ request, callbacks, jobId, turnId }) => {
+    const origin = request.origin
+      ? { origin: request.origin.kind, originId: request.origin.id }
+      : {}
     await callbacks.onStart?.({ sessionId: request.sessionId, provider: 'hermes', resolvedModel: 'eve' })
+    mocks.emitDisplay({
+      type: 'start',
+      data: { jobId, clientJobId: request.clientJobId, generation: request.generation, turnId, ...origin },
+    })
     await callbacks.onProviderProcess?.({ provider: 'hermes', hermesRunId: 'public-hermes-run-1' })
     callbacks.onChunk?.('durable ')
     await callbacks.onAnswerReady?.('durable answer')
@@ -123,6 +130,10 @@ beforeEach(async () => {
       hermesRunId: 'public-hermes-run-1',
       attachments: [outputRef],
       outputImageStats: { published: 2, attached: 1, rejected: 1 },
+    })
+    mocks.emitDisplay({
+      type: 'done',
+      data: { jobId, clientJobId: request.clientJobId, generation: request.generation, turnId, text: 'durable answer', ...origin },
     })
   })
 })
@@ -233,11 +244,22 @@ describe('public durable query runtime', () => {
   it('lets no provider metadata key overwrite the stamp (spread order on start and done)', async () => {
     // ModelRunMetadata declares no origin key today; this pins the order for
     // the day an untyped value flows through the wholesale spread.
-    mocks.runHermesPlatformTurn.mockImplementationOnce(async ({ request, callbacks }) => {
+    mocks.runHermesPlatformTurn.mockImplementationOnce(async ({ request, callbacks, jobId, turnId }) => {
+      const origin = request.origin
+        ? { origin: request.origin.kind, originId: request.origin.id }
+        : {}
       await callbacks.onStart?.({ sessionId: request.sessionId, provider: 'hermes', resolvedModel: 'eve' })
+      mocks.emitDisplay({
+        type: 'start',
+        data: { jobId, clientJobId: request.clientJobId, generation: request.generation, turnId, ...origin },
+      })
       callbacks.onChunk?.('durable ')
       await callbacks.onAnswerReady?.('durable answer')
       await callbacks.onDone?.({ text: 'durable answer', provider: 'hermes', resolvedModel: 'eve' })
+      mocks.emitDisplay({
+        type: 'done',
+        data: { jobId, clientJobId: request.clientJobId, generation: request.generation, turnId, text: 'durable answer', ...origin },
+      })
     })
     const runtime = await import('./query-job-runtime.js')
     await runtime.initQueryJobRuntime()
@@ -258,9 +280,16 @@ describe('public durable query runtime', () => {
   })
 
   it('carries the origin onto the error event too, spread after provider metadata', async () => {
-    mocks.runHermesPlatformTurn.mockImplementationOnce(async ({ request, callbacks }) => {
+    mocks.runHermesPlatformTurn.mockImplementationOnce(async ({ request, callbacks, jobId, turnId }) => {
+      const origin = request.origin
+        ? { origin: request.origin.kind, originId: request.origin.id }
+        : {}
       await callbacks.onStart?.({ sessionId: request.sessionId, provider: 'hermes', resolvedModel: 'eve' })
       await callbacks.onError?.('provider exploded')
+      mocks.emitDisplay({
+        type: 'error',
+        data: { jobId, clientJobId: request.clientJobId, generation: request.generation, turnId, error: 'provider exploded', ...origin },
+      })
     })
     const runtime = await import('./query-job-runtime.js')
     await runtime.initQueryJobRuntime()

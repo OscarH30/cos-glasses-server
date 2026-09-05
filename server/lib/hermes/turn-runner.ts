@@ -27,7 +27,7 @@ export const runHermesPlatformTurn: QueryJobRunner = async ({
     return
   }
 
-  if (request.attachmentRefs.some(ref => ref.kind !== 'image')) {
+  if (request.attachmentRefs.some(ref => ref.kind !== 'user_photo')) {
     await callbacks.onError('Only photos can be attached.')
     return
   }
@@ -80,7 +80,10 @@ export const runHermesPlatformTurn: QueryJobRunner = async ({
       replyTo: request.reference?.query,
     })
 
-    const result = await runtime.turns.wait(jobId, runtime.config.turnTimeoutMs)
+    const waiting = runtime.turns.wait(jobId, runtime.config.turnTimeoutMs)
+    const stubReply = process.env.HERMES_STUB_REPLY
+    if (stubReply) runtime.turns.complete(jobId, { text: stubReply, kind: 'reply' })
+    const result = await waiting
     const terminalOwned = await callbacks.onDone({
       text: result.text,
       provider: 'hermes',
