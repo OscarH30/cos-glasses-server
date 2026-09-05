@@ -9,8 +9,9 @@ plugin.
 Oscar's daily driver is an **iPhone**. Launch the Eve Hub app and leave it;
 iOS keeps the WebView running while the phone is locked. Unsolicited briefs
 arrive as phone notifications (ntfy or Telegram) and the Even app mirrors them
-onto the lens even when another glasses app is in front. See
-`docs/notifications.md` and `docs/hud-api.md`.
+onto the lens even when another glasses app is in front. On the upgraded VPS,
+that path is ntfy + `g2-notify` + Hermes cron — see `docs/notifications.md`
+and `docs/ops-hermes.md`. The Hub contract is `docs/hud-api.md`.
 
 **Do not deploy this fork to the VPS until Oscar says go.** Live pairing stays
 on Tailscale (`100.87.43.24:3141`).

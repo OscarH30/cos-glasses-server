@@ -5,26 +5,52 @@ running while the phone is locked, and it mirrors phone notifications onto the
 G2 as popups even when another glasses app is in front.
 
 Hermes therefore delivers unsolicited briefs through a phone notification
-channel. No glasses-server code is required for this path.
+channel. **No glasses-server deploy is required for this path.** It can go on
+the upgraded VPS today.
 
-## Recommended: self-hosted ntfy
+## Add now (upgraded VPS)
 
-1. Run ntfy on the VPS, reachable only over Tailscale.
-2. In the Eve Hermes profile `.env`:
+Run these on the VPS as the Hermes user (`cos`). They do not replace
+`@gotcos/glasses-server@6.44.4` or the Ollama shim.
+
+```bash
+# 1. ntfy, Tailscale IPv4 only — never binds 0.0.0.0
+./scripts/install-ntfy-tailscale.sh
+
+# 2. two-line G2 notification skill
+./scripts/install-g2-notify-skill.sh eve
+
+# 3. morning brief over ntfy (not g2 — that waits for fork cutover)
+./scripts/bootstrap-jobs.sh eve ntfy
+
+# 4. reachability; does not print tokens or the topic
+./scripts/remote-health.sh
+```
+
+`install-ntfy-tailscale.sh` writes Hermes vars to
+`~/.hermes/profiles/eve/ntfy.env` (mode 0600) and does not print them. Append
+that file to the eve profile `.env`. Omit `NTFY_ALLOWED_USERS` so the topic is
+outbound-only (cron/alerts, no inbound commands).
+
+Then on the iPhone:
+
+1. Install ntfy and subscribe to the topic in that env file.
+2. Even app → Settings → Notification → enable ntfy, popup mode ON.
+
+Confirm a popup on the glasses while Navigate (or any other app) is in front.
+
+## Hermes env (reference)
 
 ```
-NTFY_SERVER_URL=https://<tailscale-ntfy-host>
+NTFY_SERVER_URL=http://<tailscale-ipv4>:2586
 NTFY_TOPIC=<random-unlisted-topic>
 NTFY_PUBLISH_TOPIC=<same-as-topic>
-NTFY_TOKEN=<read-write-token>
 NTFY_HOME_CHANNEL=<same-as-topic>
 ```
 
-Omit `NTFY_ALLOWED_USERS` so the topic is outbound-only (cron/alerts, no inbound
-commands).
-
-3. On the iPhone: install ntfy, subscribe to the topic, enable notifications.
-4. In the Even app: Settings → Notification → enable ntfy, popup mode ON.
+HTTP on the tailnet is enough. Do not point this at public `ntfy.sh` for
+calendar or mail content. Optional `NTFY_TOKEN` only if you later turn on ntfy
+auth; the install script does not enable signup or a web UI.
 
 ## Alternative: Telegram
 
@@ -33,20 +59,19 @@ mirroring applies.
 
 ## Skill
 
-Attach a `g2-notify` skill to every job that delivers to ntfy:
+`hermes-plugin/skills/g2-notify/SKILL.md` is attached to every job that
+delivers to ntfy:
 
 - at most two lines
 - lead with the ask
 - `[SILENT]` when there is nothing to say
 - no markdown
 
-## First job
+## After fork cutover
 
 ```bash
-hermes -p eve cron create "daily at 06:30" \
-  "Write Oscar's morning brief for the G2. Two lines. Lead with the one thing that matters." \
-  --skill g2-notify --deliver ntfy --continuity
+./scripts/bootstrap-jobs.sh eve g2,ntfy
 ```
 
-Confirm the popup appears on the glasses while Navigate (or any other app) is
-in front. That is the attention layer.
+That second channel needs this repo listening on `:3141`. Do not pass `g2`
+until Oscar says go.
