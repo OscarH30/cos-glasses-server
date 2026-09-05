@@ -1,14 +1,16 @@
 # Hermes-only redesign plan
 
-Status: proposal. Nothing in this document is deployed. The live VPS stays on
-`@gotcos/glasses-server@6.44.4` plus the Ollama shim until Oscar says go
-(see `AGENTS.md`).
+Status: proposal, revision 2. Nothing in this document is deployed. The live
+VPS stays on `@gotcos/glasses-server@6.44.4` plus the Ollama shim until Oscar
+says go (see `AGENTS.md`).
 
-This plan turns `cos-glasses-server` from a multi-provider Cos assistant into a
-thin **G2 edge for a Hermes Agent gateway**. Hermes owns identity (SOUL),
-memory, tools, skills, sessions and scheduling. This server owns only what the
-glasses physically need: pairing, the display bus, speech in/out, media, and a
-faithful transport to the Hermes API server.
+Revision 2 replaces the "this server is an API-server client" design with
+"this server is a **Hermes gateway platform**". The G2 becomes a first-class
+Hermes channel, like Telegram or ntfy, instead of a frontend that polls an
+agent. The reason is in section 2: Even Hub apps cannot receive pushes or run
+in the background, so proactive Eve has to arrive through channels the Even
+app already mirrors, and interaction has to be modelled as a chat platform
+that tolerates the glasses app being absent.
 
 ---
 
@@ -18,458 +20,438 @@ Verified against the tree at `7995337` (130k lines incl. tests, no CI).
 
 | Concern | Today | Coupling |
 |---|---|---|
-| Chat routing | `server/lib/model-router.ts` fans out to `claude-bridge.ts` (spawns `claude -p`), `codex-bridge.ts` (`codex exec`), `cursor-bridge.ts` (`agent`), `ollama-bridge.ts` (HTTP) | Cos |
+| Chat routing | `server/lib/model-router.ts` fans out to `claude-bridge.ts` (spawns `claude -p`), `codex-bridge.ts`, `cursor-bridge.ts`, `ollama-bridge.ts` | Cos |
 | Model slots | `shared/model-preference.ts`: `opus/fable/sonnet/haiku/codex-*/cursor-*/ollama` | Cos |
-| Identity | `context-builder.ts:184` "You are COS (Chief of Staff)…", `ollama-tools.ts:351` "You are COS…"; owner name from `~/.cos-glasses/.cos-profile.json` | Cos |
-| Memory / context | `fetchLiveContext()` via Python bridge (`COS_SCRIPTS_DIR`), `memory.ts`, `context-library-search.ts`, `cos-context-browser.ts` | Cos |
-| Scheduling | `morning-brief-*.ts` (30 s tick → durable job), `task-dispatcher.ts` / `task-store.ts` | Cos |
+| Identity | `context-builder.ts:184` "You are COS (Chief of Staff)…", `ollama-tools.ts:351` "You are COS…" | Cos |
+| Memory / context | `fetchLiveContext()` via Python bridge (`COS_SCRIPTS_DIR`), `memory.ts`, `context-library-search.ts` | Cos |
+| Scheduling | `morning-brief-*.ts`, `task-dispatcher.ts` / `task-store.ts` | Cos |
 | Launcher gate | `bin/cli.cjs:347` `hasUsableAgent` exits unless Claude/Codex/Cursor is signed in | Cos |
-| Sessions | `conversation.ts` keeps history in `~/.cos-glasses/data/sessions.json` and re-sends the last 20 exchanges as prompt text; plus per-provider CLI session maps | Cos |
-| Desktop agent browsing | `agent-session-*.ts`, `agent-session-bindings.ts`, `thread-turn-queue*.ts`, `fork-thread.ts`, `claude-sessions.ts` (~12k lines with tests) | Cos |
-| Side utilities that spawn `claude` | `dictation-clean.ts`, `prompt-edit.ts`, `archive.ts`, `meeting-summary.ts`, `live-cues-*` | Cos |
-| Pairing / auth / network | `X-Cos-Token`, `network-policy.ts` (loopback, Tailscale CGNAT, RFC1918 only), `:3141` | Generic, keep |
-| Display | `display-bus.ts`, `routes/display.ts` SSE with HMAC tickets, `display-format.ts` | Generic, keep |
+| Sessions | `conversation.ts` replays 20 exchanges as prompt text from `sessions.json` | Cos |
+| Desktop agent browsing | `agent-session-*.ts`, `agent-session-bindings.ts`, `thread-*.ts`, `fork-thread.ts` (~12k lines) | Cos |
+| Pairing / auth / network | `X-Cos-Token`, `network-policy.ts` (loopback, Tailscale, RFC1918), `:3141` | Generic, keep |
+| Display | `display-bus.ts`, `routes/display.ts` SSE with HMAC tickets | Generic, keep |
 | Durable jobs | `query-job-*.ts`: fsync-then-202, reattach after phone backgrounds | Generic, keep |
-| Speech | `transcribe*.ts`, `whisper-local.ts`, `vad-silero.ts`, `tts*.ts` (Kokoro + OpenAI), voice enrolment, meetings | Generic, keep |
-| Media | `media-store.ts`, chunked/video upload, `docs/media-upload-contract.md` | Generic, keep |
-| OpenAI-compat | `routes/openai-compat.ts` (`/v1/chat/completions`, `/v1/models`) for Even "Add Agent" | Generic shape, rewire |
+| Speech / media / meetings | `transcribe*`, `whisper-local`, `tts*`, `media-store`, meeting pipeline | Generic, keep |
+| OpenAI-compat | `routes/openai-compat.ts` for Even AI "Add Agent" | Generic shape, rewire |
 
-There is no Hermes code in the tree. The only Hermes reference is `AGENTS.md`.
+## 2. Runtime constraints that shape everything
 
-## 2. Hermes surface we will build on
+From the Even Hub docs (Background & Lifecycle, FAQ, App Submission, updated
+Jun–Aug 2026) and the Even support centre:
 
-From the Hermes Agent docs (API Server, Cron, Profiles, Messaging), current as
-of Sep 2026. Every item below is feature-detected at boot via
-`GET /v1/capabilities`; nothing is assumed.
+| Fact | Consequence |
+|---|---|
+| A Hub app is a WebView inside the Even Realities phone app; the glasses only render containers and emit input events | All logic runs on the phone; this server talks to the phone, never to the glasses |
+| iOS: the WebView keeps running with the phone locked and the Even app backgrounded; WebSockets "typically hold". Android: may be suspended under memory pressure | A resident app works with the phone in a pocket on iOS; on Android it works while foregrounded and must cold-start cleanly |
+| Plugins are foreground-only on the glasses: no push, no network while suspended, one app in front at a time | Our app cannot be the channel for *unsolicited* delivery. Opening Navigate/Teleprompt/another Hub app exits ours |
+| The Even app mirrors phone notifications onto the glasses as popups even while another glasses app runs, and keeps a Notification Center browsable with the ring. Notifications-only, no reply | Anything that reaches the phone as a notification reaches the glasses regardless of which app is in front |
+| Even AI "Add Agent" points the built-in voice assistant at a custom OpenAI-compatible endpoint | A pull path from the glasses menu that needs no Hub app |
+| SDK 0.0.14: contextual menu with up to 10 action items (`menuObject`), long-press events; root double-tap must call `shutDownPageContainer(1)` | Approve / deny / snooze can be native menu items inside our app |
+| Beta/QA installs are tested with the phone locked and the Even app backgrounded | The resident-dashboard posture is what reviewers expect, not a hack |
 
-| Hermes feature | Endpoint / mechanism | What it replaces here |
-|---|---|---|
-| Gateway | `hermes gateway` daemon: API server, cron ticker (60 s), sessions, delivery ledger | Our process supervision for Cos "mind" |
-| API server | `API_SERVER_ENABLED=true`, `API_SERVER_PORT`, `API_SERVER_KEY`, loopback bind by default | `claude`/`codex`/`agent` subprocesses |
-| Chat (stateless) | `POST /v1/chat/completions` (SSE, `hermes.tool.progress`, inline `image_url`) | Bridges' streaming loop |
-| Runs | `POST /v1/runs` → `run_id`; `GET /v1/runs/{id}`; `GET /v1/runs/{id}/events` SSE; `POST …/stop`; `POST …/approval` | Durable query jobs' provider leg |
-| Sessions | `/api/sessions` CRUD, `/{id}/messages`, `/{id}/fork`, `/{id}/chat`, `/{id}/chat/stream` | `conversation.ts` history + CLI session maps |
-| Session headers | `X-Hermes-Session-Id` (transcript, rotates on new chat), `X-Hermes-Session-Key` (stable long-term-memory scope) | Our 20-exchange prompt replay |
-| System prompt layering | `system` / `instructions` is layered **on top of** Hermes' own SOUL + tools | `buildSystemPrompt` "You are COS" |
-| Model selection | per-request `model`, `provider`, `model_options.reasoning_effort`; `model_routes` aliases; `direct_model_requests` | `EffortPreference` → CLI flags |
-| Cron / Jobs | `/api/jobs` CRUD, `pause`, `resume`, `run`; skills attach, `enabled_toolsets`, `continuity`, `context_from`, `no_agent` scripts, `[SILENT]`, `wakeAgent` gate | Morning brief pipeline, task dispatcher |
-| Profiles | `hermes profile create <name>`; own `HERMES_HOME`, SOUL, memory, sessions, cron, API port/key; model id = profile name; `/p/<profile>/` multiplex routing | Model picker (Opus/GPT/Grok/…) |
-| Discovery | `/v1/capabilities`, `/v1/models`, `/v1/skills`, `/v1/toolsets`, `/api/model/options`, `/health`, `/health/detailed` | Provider probes and catalogs |
-| Limits | `max_concurrent_runs` → HTTP 429; `Idempotency-Key` header (5 min cache); no file upload, images only | — |
+Hermes side (API Server, Cron, Plugins, ntfy docs, Sep 2026):
 
-Two facts that shape the design:
+| Fact | Consequence |
+|---|---|
+| Gateway platforms are plugins: `plugins/platforms/<name>/{plugin.yaml,adapter.py}` calling `ctx.register_platform(...)` with `adapter_factory`, `env_enablement_fn`, `standalone_sender_fn`, `cron_deliver_env_var`, `platform_hint`, `max_message_length` | A `g2` platform is ~400 lines of Python (the ntfy adapter is the template) and needs no Hermes core change |
+| User platform plugins live in `~/.hermes/plugins/platforms/<name>/` and are opt-in via `plugins.enabled` | Installed per profile, explicitly consented |
+| `ctx.register_approval_transport(name, present)` routes Hermes tool-approval prompts to a custom UI; selected via `security.approval.transport`; failures deny by default, `transport_fallback: builtin` shows the prompt on the originating chat instead | "Ask me before sending" becomes a Hermes-owned approval that we merely *present* on the glasses |
+| Cron delivers to any platform (`deliver: "g2"`, `"g2,ntfy"`, `"origin"`, `"all"`), honours `[SILENT]`, supports `continuity`, skills, `enabled_toolsets` | Scheduled briefs land on the glasses with no polling |
+| Gateway chat commands `/new`, `/sessions`, `/resume`, `/model`, `/cron`, `/bg`, `/status` are plain messages | Session management on the glasses is text through the platform, not a REST proxy |
+| ntfy adapter (shipped May 2026) publishes to a topic the ntfy phone app subscribes to; Telegram/Signal/etc. likewise | Zero-code push channel from Hermes to the phone, mirrored to the lens by the Even app |
+| API server (`/v1/*`, `/api/sessions`, `/api/jobs`, `/v1/runs`) remains available on the same gateway | Kept as a secondary surface for Even AI passthrough, utility completions and the phone's job editor |
+| The ntfy adapter source carries a `PLUGIN-COMPAT` block for a "Sep 2026 decomposition" of `gateway.platforms` imports | Pin the Hermes version we develop against; keep imports to `BasePlatformAdapter`, `MessageEvent`, `SendResult`, `PlatformConfig` |
 
-- Port `8643` in `AGENTS.md` is a **named-profile** port (default profile is
-  `8642`). A named profile advertises its **profile name** as the model id
-  unless `API_SERVER_MODEL_NAME=hermes-agent` is set in that profile's `.env`,
-  and it needs its own `API_SERVER_KEY`. The client must read `/v1/models`
-  rather than hardcode `hermes-agent`.
-- Hermes has no "G2" delivery platform. Cron output can go to `local`
-  (`~/.hermes/cron/output/{job_id}/`), a messaging channel, or `bot-chat`.
-  Getting a scheduled brief onto the glasses needs a bridge (section 5.4).
-
-## 3. Target architecture
+## 3. Target architecture: three delivery tiers
 
 ```
-Even G2 ──BLE──► phone (Even Hub app, separate repo)
-                    │  HTTPS over Tailscale, X-Cos-Token
-                    ▼
-        cos-glasses-server :3141  (this repo, Node)
-        ├─ pairing / token / network policy          (unchanged)
-        ├─ display bus + SSE tickets                  (unchanged)
-        ├─ STT / TTS / meetings / media               (unchanged)
-        ├─ durable query jobs                         (kept, provider leg swapped)
-        ├─ hermes/                                    (new)
-        │   ├─ client.ts       auth, capabilities, retries, 429/401 mapping
-        │   ├─ bridge.ts       StreamCallbacks adapter over Runs / chat SSE
-        │   ├─ sessions.ts     glasses session ↔ Hermes session index
-        │   ├─ jobs.ts         Jobs API proxy + inbox bridge
-        │   ├─ profiles.ts     profile registry → picker
-        │   └─ hud-prompt.ts   2–4 line display overlay, no persona
-        └─ /v1/chat/completions passthrough (Even "Add Agent")
-                    │  loopback only, Bearer API_SERVER_KEY
-                    ▼
-        Hermes gateway (profile "eve" or similar) 127.0.0.1:8643
-        SOUL.md · memory · skills · tools · sessions · cron
+                    ┌──────────────────────────────────────────────┐
+                    │ Hermes gateway, profile "eve"  (~/.hermes/…)  │
+                    │ SOUL · memory · skills · tools · cron        │
+                    │ platforms: g2 (plugin) · ntfy · telegram …    │
+                    │ approval transport: g2                        │
+                    └───────┬──────────────────┬───────────────────┘
+      Tier 1 attention      │                  │ Tier 2 interaction
+      deliver: ntfy         │                  │ deliver: g2 / origin
+                            ▼                  ▼ loopback SSE in, POST out
+                     ntfy / Telegram    cos-glasses-server :3141 (this repo)
+                            │           ├─ /hermes/*  plugin-facing (loopback, plugin token)
+                            │           ├─ inbox + approvals stores (replay on foreground)
+                            │           ├─ display bus · durable jobs · STT/TTS · media
+                            │           └─ /v1/chat/completions passthrough (Tier 3)
+                            ▼                  │ HTTPS over Tailscale, X-Cos-Token
+              phone notification               ▼
+                            │           Even Hub "Eve" app (separate repo)
+                            ▼           resident dashboard · approvals · voice
+              Even app mirrors popup           │ BLE
+                            └──────────────────┴────────► Even G2
 ```
+
+**Tier 1 — attention (Eve tells you something).** Hermes → ntfy (or
+Telegram) → phone notification → Even app popup on the lens. Works with the
+phone locked and any glasses app in front. Zero code in this repo; it is
+Hermes configuration plus a skill that writes notification-shaped output.
+This is the layer that makes proactive Eve reach the glasses at all.
+
+**Tier 2 — interaction (you answer, ask, approve).** Hermes treats the G2 as
+a chat platform via the `g2` plugin. This server is the platform's transport:
+it receives Hermes messages and approval requests, queues them, and fans them
+out to the Eve Hub app over the existing display bus; it forwards taps, menu
+choices and speech from the app back to Hermes as ordinary gateway messages.
+When the app is not in front, messages wait in the inbox and approvals fall
+back to the originating chat (Tier 1 channel) after a timeout.
+
+**Tier 3 — pull without the app.** Even AI "Add Agent" → our
+`/v1/chat/completions` → Hermes API server. Voice questions from the glasses
+menu with nothing installed but the endpoint.
 
 Design rules:
 
-1. One provider. `model-router.ts` collapses to "call Hermes". No Claude,
-   Codex, Cursor or Ollama code paths remain, and no fake-Ollama shim.
-2. Hermes owns the conversation. This server stops replaying history as prompt
-   text; it sends one user turn per request against a Hermes session.
-3. Hermes owns the persona. The only instructions we send describe the
-   display surface (section 5.2). No owner name, no calendar cache, no "COS".
-4. Profiles are the picker. What used to be a model dropdown becomes a
-   Hermes-profile dropdown (Eve / work / research …). Effort maps to
-   `model_options.reasoning_effort` inside the chosen profile.
-5. Scheduling lives in Hermes cron. This server only proxies job CRUD for the
-   phone UI and bridges delivered output onto the HUD.
-6. Hard gates unchanged: `:3141` stays on Tailscale/LAN, the Hermes API key
-   never leaves this host, nothing is published or deployed without Oscar.
+1. Hermes owns persona, memory, sessions, scheduling and approval policy.
+   This server never composes a system prompt; display constraints reach the
+   model through the plugin's `platform_hint`.
+2. This server is a transport and a cache, not an agent client. The only
+   agent-facing HTTP it makes is Tier 3 passthrough and utility completions.
+3. The Hub app is a resident dashboard: launch it and leave it; it
+   reconnects and replays on `FOREGROUND_ENTER_EVENT`.
+4. Hard gates unchanged: `:3141` stays on Tailscale/LAN, the plugin token and
+   the Hermes API key never leave the host, nothing is published or deployed
+   without Oscar.
 
-## 4. Sequencing
+## 4. The `g2` Hermes platform plugin
 
-Six phases. Each ends in a passing `npm test` / `npm run typecheck` and a
-tagged commit on this fork. Phases 1–2 are additive (Cos paths still work),
-so the branch stays runnable for A/B on a dev box; Phase 5 is the deletion.
+Lives in this repo under `hermes-plugin/g2/` and is installed into
+`~/.hermes/profiles/<profile>/plugins/platforms/g2/` by
+`scripts/install-hermes-plugin.sh` (copy or symlink; enable with
+`hermes -p <profile> plugins enable g2-platform`). The Python code depends only
+on `httpx` (already a Hermes dependency) and the same four imports the ntfy
+adapter uses.
 
-| Phase | Deliverable | Invasiveness |
+### 4.1 Files
+
+```
+hermes-plugin/g2/
+├── plugin.yaml      kind: platform; requires_env G2_SERVER_URL, G2_PLUGIN_TOKEN
+├── adapter.py       G2Adapter(BasePlatformAdapter) + register(ctx)
+├── approval.py      approval transport: present(request) → server → decision
+└── README.md        install, config keys, wire protocol
+```
+
+### 4.2 Registration
+
+```python
+def register(ctx):
+    ctx.register_platform(
+        name="g2", label="Even G2",
+        adapter_factory=lambda cfg: G2Adapter(cfg),
+        check_fn=check_requirements, validate_config=validate_config,
+        is_connected=is_connected,
+        required_env=["G2_SERVER_URL", "G2_PLUGIN_TOKEN"],
+        env_enablement_fn=_env_enablement,          # shows in `gateway status`
+        cron_deliver_env_var="G2_HOME_CHANNEL",      # deliver: g2
+        standalone_sender_fn=_standalone_send,       # out-of-process cron
+        allowed_users_env="G2_ALLOWED_USERS", allow_all_env="G2_ALLOW_ALL_USERS",
+        max_message_length=600,                      # ~10 HUD lines
+        emoji="👓", pii_safe=True, allow_update_command=False,
+        platform_hint=(
+            "You are speaking on Even G2 smart glasses: a 576x288 monochrome "
+            "display showing about four short lines at a time, read while "
+            "walking. Lead with the answer or the question in one or two "
+            "lines. Plain text only: no markdown, tables, code fences or "
+            "emoji. Expand only when asked. If a decision is needed, state it "
+            "as a yes/no question."
+        ),
+    )
+    ctx.register_approval_transport("g2", present_approval)
+```
+
+Env (per profile `.env`): `G2_SERVER_URL` (default `http://127.0.0.1:3141`),
+`G2_PLUGIN_TOKEN` (shared secret minted by this server on first boot, stored
+in `~/.cos-glasses/.env` as `HERMES_PLUGIN_TOKEN`), `G2_HOME_CHANNEL`
+(default `g2`), `G2_ALLOWED_USERS` (default `g2`). Identity follows the ntfy
+model: one trusted channel, `user_id == chat_id == "g2"`, `chat_type="dm"`;
+authorization comes from the token, never from message fields.
+
+### 4.3 Wire protocol (plugin ↔ this server, loopback only)
+
+Mirrors the ntfy adapter: stream in, POST out. The plugin is the client; this
+server is the listener. All routes are under `/hermes/`, require
+`Authorization: Bearer <HERMES_PLUGIN_TOKEN>`, and are refused from non-loopback
+addresses regardless of token.
+
+| Direction | Route | Body | Notes |
+|---|---|---|---|
+| plugin ← server | `GET /hermes/stream` (SSE) | `event: message` `{ id, text, attachments?[], reply_to?, correlation_id }`; `event: approval_decision` `{ request_id, choice }`; `event: keepalive` | One connection per adapter; `Last-Event-ID` replay from the inbound ledger; reconnect with the ntfy backoff table |
+| plugin → server | `POST /hermes/deliver` | `{ chat_id, text, reply_to?, correlation_id?, kind: "reply"\|"cron"\|"notice"\|"progress", media?[] }` | Returns `{ message_id }`; `progress` maps to display `tool_status`; `reply` with a `correlation_id` completes the matching durable job |
+| plugin → server | `POST /hermes/approval` | `{ request_id, digest, command, description, choices[], timeout_s, origin }` | Server stores it, emits `approval_required` on the display bus, returns immediately |
+| plugin → server | `GET /hermes/approval/{request_id}` (long-poll ≤ timeout) | — | `{ choice }` or `408`; `present_approval` awaits this and returns `request.respond(choice)` |
+| plugin → server | `POST /hermes/typing` | `{ chat_id, on }` | Optional; drives the lens "Eve is working…" line |
+| plugin → server | `GET /hermes/health` | — | Adapter `connect()` probe |
+
+`_standalone_send` posts to `/hermes/deliver` with `kind: "cron"` so
+`deliver: g2` works even when cron runs out of process.
+
+### 4.4 Message lifecycle
+
+- **Glasses → Hermes.** Phone `POST /api/query-jobs` (unchanged contract) →
+  server persists the job, emits `message` on `/hermes/stream` with the job
+  id as `correlation_id` → adapter `handle_message(MessageEvent)` → Hermes
+  runs the turn in the `g2` chat session → `adapter.send()` →
+  `POST /hermes/deliver { correlation_id }` → server completes the job, writes
+  the answer to the display bus and to the inbox.
+- **Hermes → glasses (unsolicited).** Cron or a `send_message` tool call →
+  `deliver` with no `correlation_id` → inbox entry + display card. If no phone
+  is attached to the display bus, the entry waits; the app fetches
+  `GET /api/inbox?since=<cursor>` on foreground.
+- **Approval.** Hermes gates a tool → transport `present()` →
+  `POST /hermes/approval` → display `approval_required` → app renders
+  Approve / Deny / Always via list or contextual menu → `POST
+  /api/approvals/{id} { choice }` → long-poll returns → Hermes proceeds.
+  Timeout (Hermes `approvals.timeout`) → deny, and with
+  `security.approval.transport_fallback: builtin` the prompt re-appears on
+  the originating chat (e.g. Telegram), which is the "phone in pocket" path.
+- **Streaming.** Gateway adapters receive the final message plus progress
+  hooks, not token deltas. The lens shows `tool_status` lines during the turn
+  and the answer at once, which suits a four-line display. If token streaming
+  turns out to matter, the Tier 3 API-server path has it.
+- **Chat commands.** `/new`, `/sessions`, `/resume <name>`, `/model`, `/cron
+  list`, `/status` are sent as plain text from the app's menu and answered by
+  the gateway like any other platform.
+
+### 4.5 Profiles
+
+Each Hermes profile runs its own gateway and its own `g2` adapter instance,
+each connecting to `/hermes/stream?profile=<name>`. The server keeps one
+inbound ledger per profile and exposes `GET /api/agent/profiles` →
+`[{ name, label, connected, lastSeen }]` for the phone picker. A session on
+the phone is bound to one profile; switching profiles is a new conversation.
+The "model picker" of the Cos era becomes this profile picker; per-turn
+effort (`high|xhigh|max`) is sent as a `/model --once` prefix only when the
+user asks for it.
+
+## 5. What this server becomes
+
+Kept as-is: `index.ts` listen/bind, `api-auth.ts`, `network-policy.ts`,
+`display-bus.ts`, `routes/display.ts`, `query-job-*.ts`, all speech, media
+and meeting modules, `maintenance-lifecycle.ts`, `message-era.ts`.
+
+New:
+
+| Module | Role |
+|---|---|
+| `server/routes/hermes-platform.ts` | The `/hermes/*` routes from 4.3; loopback + plugin-token guard |
+| `server/lib/hermes/inbound-ledger.ts` | Append-only outbound-to-Hermes log per profile with `Last-Event-ID` replay |
+| `server/lib/hermes/inbox.ts` | Delivered messages with cursor, read state, TTL; feeds `GET /api/inbox` and the display bus |
+| `server/lib/hermes/approvals.ts` | Pending approval store with expiry, long-poll waiters, `POST /api/approvals/:id` |
+| `server/lib/hermes/profiles.ts` | Connected-adapter registry, health, `GET /api/agent/profiles` |
+| `server/lib/hermes/turn-runner.ts` | The durable-job runner for the platform path: emit inbound, await matching `deliver`, map progress to `tool_status`, timeout → job failure with a lens-safe message |
+| `server/lib/hermes/api-client.ts` | Thin API-server client (bearer `HERMES_API_KEY`) used only by Tier 3 passthrough, `completeOnce()` utility completions and the optional jobs editor |
+
+Changed:
+
+- `routes/query-jobs.ts` / `query-job-runtime.ts`: the runner calls
+  `turn-runner.ts` instead of `callModelStreaming`. Job identity, fsync,
+  reattach and cancel semantics are untouched; cancel emits a `/stop`-style
+  text to the gateway (Hermes' busy-input "interrupt" behaviour).
+- `routes/query.ts` (legacy SSE): thin wrapper over the same runner.
+- `routes/openai-compat.ts`: becomes a passthrough to the profile's API
+  server with `X-Hermes-Session-Id` per calendar day and
+  `X-Hermes-Session-Key: agent:main:g2:<owner>`; `/v1/models` advertises
+  connected profiles.
+- `conversation.ts`: shrinks to a phone-facing projection (glasses session id
+  ↔ profile ↔ last N delivered cards) for the display bus and message
+  numbering; it no longer feeds any prompt.
+- `dictation-clean.ts`, `prompt-edit.ts`, `archive.ts`, `meeting-summary.ts`:
+  swap `spawn('claude', …)` for `completeOnce()` with a throwaway
+  `X-Hermes-Session-Id`, same budgets as today.
+
+## 6. Sequencing
+
+| Phase | Deliverable | Where the work is |
 |---|---|---|
-| 1 | Hermes client + bridge behind a new `hermes` model slot | Additive: new `server/lib/hermes/`, 1 branch in `model-router.ts`, 1 slot in `shared/model-preference.ts` |
-| 2 | Sessions handed to Hermes; HUD prompt; profiles picker | Rewrites `conversation.ts` role, `openai-compat.ts`, `routes/sessions.ts`; new `/api/agent/*` routes |
-| 3 | Cron replaces morning brief + tasks | New `hermes/jobs.ts`, `routes/jobs.ts`; `morning-brief-*`, `task-*` become thin shims then go |
-| 4 | Launcher, health, config, ops | `bin/cli.cjs`, `routes/health.ts`, `.env.example`, systemd notes |
-| 5 | Delete Cos | Remove bridges, catalogs, ledgers, agent-session browsing, Python bridge, identity strings |
-| 6 | Even Hub contract + docs | `docs/hud-api.md`, README rewrite, CHANGELOG 7.0.0 |
+| 0 | Tier 1 live: ntfy (or Telegram) channel, G2-notification skill, Even app notification permissions | Hermes config + `docs/notifications.md`; no server code |
+| 1 | `g2` plugin + `/hermes/*` routes + inbox/approvals/profiles stores; `deliver: g2` and an approval round-trip work against a dev gateway | `hermes-plugin/g2/`, new `server/lib/hermes/*`, `routes/hermes-platform.ts` |
+| 2 | Glasses chat through the platform: durable jobs → gateway turns; `/new`/`/sessions` from the app; profile picker; Tier 3 passthrough rewired | `turn-runner.ts`, `query-job-runtime.ts`, `openai-compat.ts`, `conversation.ts`, `shared/agent-preference.ts` |
+| 3 | Scheduling on Hermes cron: morning brief and tasks recreated as jobs with `deliver: "g2,ntfy"`; optional phone jobs editor via API-server `/api/jobs` proxy | `morning-brief-*`, `task-*` retired; `routes/jobs.ts` (optional) |
+| 4 | Launcher, health, config, ops | `bin/cli.cjs`, `routes/health.ts`, `.env.example`, `docs/ops-hermes.md` |
+| 5 | Delete Cos | Bridges, catalogs, ledgers, agent-session browsing, Python bridge, identity strings |
+| 6 | Hub app contract + docs | `docs/hud-api.md`, README, CHANGELOG 7.0.0 |
 
-## 5. Phase detail
+Each phase ends with `npm test` and `npm run typecheck` green and a tagged
+commit. Phases 1–3 are additive; the Cos paths keep working until Phase 5.
 
-### 5.1 Phase 1 — Hermes client and bridge
+### 6.1 Phase 0 — attention channel (Hermes side only)
 
-New directory `server/lib/hermes/`.
+- `hermes -p eve gateway setup` → ntfy: `NTFY_TOPIC=<random>`,
+  `NTFY_PUBLISH_TOPIC` same, no `NTFY_ALLOWED_USERS` (outbound-only),
+  `NTFY_SERVER_URL` pointing at a self-hosted ntfy on the VPS behind
+  Tailscale (the public `ntfy.sh` is fine for a trial, not for calendar or
+  mail content). Telegram is the alternative if Oscar prefers a channel he can
+  reply in.
+- Phone: ntfy app subscribed to the topic; Even app → Settings →
+  Notification → enable for ntfy; popup mode ON.
+- Skill `g2-notify` in the profile: output ≤ 2 lines, lead with the ask,
+  `[SILENT]` when nothing to say, no markdown. Attached to every job that
+  delivers to ntfy.
+- Recreate the morning brief as a first job here so Tier 1 is validated end
+  to end before any server code changes:
+  `hermes -p eve cron create "daily at 06:30" "<brief prompt>" --skill
+  g2-notify --deliver ntfy --continuity`.
 
-**`client.ts`**
+### 6.2 Phase 1 — plugin and transport
 
-- Config (all read in `server/env.ts` order: `~/.cos-glasses/.env` → repo
-  `.env` → process env):
-  - `HERMES_API_URL` default `http://127.0.0.1:8643` (no `/v1`; the client
-    appends paths). Refuse non-loopback and non-Tailscale hosts unless
-    `HERMES_ALLOW_REMOTE=1`.
-  - `HERMES_API_KEY` required. Startup fails closed with a clear message if
-    absent; this is the only credential the glasses path needs.
-  - `HERMES_MODEL` optional override; otherwise the first id from
-    `/v1/models`.
-  - `HERMES_SESSION_KEY_PREFIX` default `agent:main:g2`.
-- Boot probe: `GET /health`, then `GET /v1/capabilities` with the key. Cache
-  the capabilities object; expose it via `/api/health` as `hermes: { ok,
-  model, profile, runs, sessions, jobs, session_key_header }`.
-- Transport helpers: `fetchJson`, `openSse` (line parser for `event:`/`data:`
-  frames, honours `AbortSignal`), `Idempotency-Key` on every run-starting
-  POST so a phone retry after a lost 202 does not start a second turn.
-- Error mapping to user strings shown on the lens:
-  - connection refused → "Hermes gateway is not running."
-  - 401 → "Hermes API key rejected." (never echo the key)
-  - 429 → "Hermes is busy (N runs). Try again shortly." with `Retry-After`
-  - 400 `unsupported_content_type` → "Only photos can be attached."
+- Write `hermes-plugin/g2/` per section 4. Unit tests in Python with a fake
+  server (httpx `MockTransport`), covering reconnect backoff, dedup,
+  `standalone_send`, approval timeout → deny.
+- Server: `routes/hermes-platform.ts` and the three stores. Plugin token
+  minted at boot if `HERMES_PLUGIN_TOKEN` is unset, written to
+  `~/.cos-glasses/.env`, printed once (same pattern as `COS_API_TOKEN`).
+- Display bus: new event types `hermes_message`, `approval_required`,
+  `approval_resolved`, `agent_status`. Ticketless subscribers still get
+  lifecycle-only projections (existing 6.42 rule).
+- `GET /api/inbox?since=`, `POST /api/inbox/:id/read`,
+  `POST /api/approvals/:id`, `GET /api/agent/profiles`.
+- Exit: on a dev box, `hermes -p eve cron create "in 1m" "say hello"
+  --deliver g2` shows on the display stream; a gated `terminal` call presents
+  an approval that a curl to `/api/approvals/:id` resolves.
 
-**`bridge.ts`** — `callHermesStreaming(query, sessionId, callbacks, options)`
-implementing the existing `StreamCallbacks` / `CallOptions` contract
-(`server/lib/claude-bridge.ts:330-394`) so `routes/query.ts`,
-`query-job-runtime.ts` and `openai-compat.ts` keep working unchanged.
+### 6.3 Phase 2 — chat through the platform
 
-Transport selection, in order of preference by capability flag:
+- `turn-runner.ts` implements the runner interface `query-job-coordinator.ts`
+  already expects. Correlation by job id; progress → `tool_status`; a turn
+  with no `deliver` inside Hermes' per-turn timeout fails the job with
+  "Eve did not answer; check the gateway."
+- Attachments: images are passed in the inbound event as
+  `{ url: "http://127.0.0.1:3141/api/media/file/<id>?plugin=1" }`, fetched by
+  the adapter with the plugin token and attached to `MessageEvent` as the
+  gateway expects for image input. Non-image attachments are rejected before
+  the job is admitted.
+- `shared/model-preference.ts` → `shared/agent-preference.ts`:
+  `{ profile: string; effort?: 'high'|'xhigh'|'max' }`; legacy model strings
+  normalise to the default profile for one release.
+- `openai-compat.ts` rewired to the API client; Even AI passthrough tested
+  from the glasses menu.
+- Exit: full round trip from the Hub app (or curl) through the gateway and
+  back, with `/new` starting a fresh Hermes session.
 
-1. `run_submission && run_events_sse`: `POST /v1/runs` with `{ input,
-   session_id, instructions, model_options }`, then `GET
-   /v1/runs/{id}/events`. Token deltas → `onChunk`; `tool.*` /
-   `hermes.tool.progress` → `onToolStatus`; `subagent.*` → `onToolStatus`
-   ("Delegating…"); terminal → `onDone`/`onError`. Return `run_id` in
-   `ModelRunMetadata` so the durable job store can poll `GET /v1/runs/{id}`
-   after a reconnect and call `POST …/stop` on cancel. This is the only
-   transport that gives the phone a reattach-after-background story equal to
-   today's Claude one.
-2. Else `session_chat_stream`: `POST /api/sessions/{id}/chat/stream`.
-3. Else `/v1/chat/completions` with `stream: true`, `X-Hermes-Session-Id`,
-   sending only the single user message (Hermes has the transcript).
+### 6.4 Phase 3 — scheduling
 
-Common behaviour:
-
-- Headers: `Authorization: Bearer`, `X-Hermes-Session-Id: <hermes session>`,
-  `X-Hermes-Session-Key: ${prefix}:${ownerId}` (stable per paired phone so
-  Honcho-style long-term memory does not fragment when the transcript rotates).
-- Images: `ModelImageInput` → `data:image/...;base64` `image_url` parts.
-  Non-image attachments are rejected before the call with the 400 string above.
-- Effort: `EffortPreference` `high|xhigh|max|ultracode` →
-  `model_options.reasoning_effort` `high|xhigh|max|ultra`. No `model` or
-  `provider` is sent from the glasses path (profile decides), so the
-  `direct_model_requests` flag is irrelevant.
-- Timeouts: reuse the inactivity + wall + hard-max pattern from
-  `ollama-bridge.ts:41-50`, but with the wall at 10 min because Hermes turns
-  are agentic. SSE comments (`: keepalive`) are already emitted upstream by
-  `openai-compat.ts`; `routes/query.ts` gets the same.
-- Ledger: `hermes-run-ledger.ts` mirroring `ollama-run-ledger.ts` (run id,
-  session, status, error class) so `/api/cli-debug` and health keep working.
-
-**Wiring**
-
-- `shared/model-preference.ts`: add `'hermes'` slot; `isHermesModel`;
-  labels `Hermes` / `HRM` / tag `E`. Keep other slots for now.
-- `model-router.ts`: `if (isHermesModel(resolved)) return callHermesStreaming(...)`.
-- `COS_G2_DEFAULT_MODEL=hermes` becomes the documented default in
-  `.env.example`.
-- Tests: `server/lib/hermes/__fixtures__/fake-hermes.ts` — an in-process
-  Express fake implementing `/health`, `/v1/capabilities`, `/v1/models`,
-  `/v1/runs*`, `/api/sessions*`, `/api/jobs*` with scripted SSE. Contract
-  tests for each transport, 401/429 mapping, abort → `stop`, idempotency.
-
-Exit criteria: a query from the phone with the `hermes` slot streams through
-a real gateway on a dev box, tool status shows on the lens, cancel stops the
-run, and the durable job reattaches after the app is backgrounded.
-
-### 5.2 Phase 2 — Sessions, HUD prompt, profiles
-
-**Sessions become Hermes sessions.** `conversation.ts` shrinks to an index:
-
-```ts
-interface GlassesSession {
-  id: string            // what the phone already sends
-  hermesSessionId: string
-  profile: string
-  title?: string
-  createdAt: number
-  lastActiveAt: number
-}
-```
-
-- `getOrCreateSession()` creates a Hermes session (`POST /api/sessions`) on
-  first use and stores the mapping in `sessions.json` (same file, new shape,
-  one-time migration that keeps the old exchanges under `legacy/` for the
-  archive view).
-- "New chat" / context break → new Hermes session; old one gets
-  `PATCH { end_reason: 'user_new_chat' }`.
-- Session list and transcript views (`routes/sessions.ts`,
-  `routes/session-index.ts`, message-ref) read `GET /api/sessions/{id}/messages`
-  and cache the projection locally for the display bus. Message numbering
-  (`message-era.ts`) stays local; it is a HUD concern.
-- "Recall message N" (`PromptReference`) is sent as part of the user turn
-  text, not as replayed history.
-- Fork → `POST /api/sessions/{id}/fork`; exposed as `/api/sessions/:id/fork`
-  for the phone.
-- `openai-compat.ts` daily reset (`getOrResetG2Session`) → keep the rule but
-  implement as "rotate Hermes session at local midnight". Point Hermes'
-  `session_reset` at `none` for the API-server platform so only one side
-  resets.
-- `acquireModelSessionRunLock` in `model-router.ts` stays; Hermes serialises
-  per session too, but the local lock prevents two 429-able submissions.
-
-**HUD prompt.** New `hud-prompt.ts` replaces `buildSystemPrompt`,
-`buildLightweightSystemPrompt`, `buildPrewarmSystemPrompt` and
-`buildOllamaSystemPrompt`. It is sent as `instructions` and layered by Hermes
-on top of SOUL:
-
-```
-You are answering on Even G2 smart glasses: a 576x288 monochrome display,
-about 4 short lines visible at once, read while walking.
-Lead with the answer in one or two lines. Plain text only: no markdown,
-tables, code fences or emoji. Expand only when asked.
-```
-
-Plus optional runtime lines the server actually knows: local time zone, the
-attached-photo notice, and the `[SILENT]`-style instruction for background
-turns. No owner name, no calendar, no tasks; if Hermes wants those it has its
-own tools and memory.
-
-**Profiles replace the model picker.** New `hermes/profiles.ts` reads
-`HERMES_PROFILES` (JSON array of `{ name, url, key, label }`) with a single
-default entry synthesised from `HERMES_API_URL`/`HERMES_API_KEY`. Each entry is
-probed for `/v1/models` at boot and every 15 min (same cadence as the old
-Codex catalog).
-
-- `GET /api/agent/profiles` → `[ { name, label, ready, model, skills: n,
-  toolsets: [...] } ]` for the phone picker (reads `/v1/skills` and
-  `/v1/toolsets` once per refresh).
-- Per-session profile is stored on `GlassesSession.profile`; switching
-  profiles mid-session starts a new Hermes session because sessions do not
-  cross profiles.
-- `shared/model-preference.ts` is replaced by `shared/agent-preference.ts`:
-  `{ profile: string; effort: EffortPreference }`. `normalizeModelPreference`
-  keeps accepting the legacy strings for one release and maps them all to the
-  default profile so old phone builds still work.
-- Multiplexed gateways (`gateway.multiplex_profiles`) are supported by
-  allowing `url` to include a `/p/<profile>` prefix; the client just joins
-  paths.
-
-Exit criteria: phone shows profiles instead of models, session list comes
-from Hermes, "new chat" produces a fresh Hermes session, no request carries
-Cos text.
-
-### 5.3 Phase 3 — Cron replaces morning brief and tasks
-
-**Job CRUD proxy.** `hermes/jobs.ts` + `routes/jobs.ts` expose an
-allowlisted subset of the Hermes Jobs API to the phone under `/api/jobs`:
-
-| Phone route | Hermes | Notes |
-|---|---|---|
-| `GET /api/jobs` | `GET /api/jobs` | adds `profile`, strips `workdir`/script paths |
-| `POST /api/jobs` | `POST /api/jobs` | body: `name, prompt, schedule, skills[], enabled_toolsets[], continuity, deliver` |
-| `PATCH /api/jobs/:id` | `PATCH` | partial merge |
-| `POST /api/jobs/:id/{pause,resume,run}` | same | `run` returns immediately; result arrives via inbox |
-| `DELETE /api/jobs/:id` | same | |
-
-Prompt-injection scanning and `model`/`provider` pins are Hermes' job; the
-proxy never lets the phone set a per-job model, matching Hermes' own rule
-that inference pins are user-owned. `no_agent` script jobs are not creatable
-from the phone (they need a script on disk).
-
-**Morning brief as a cron job.** `morning-brief-config.ts` becomes a
-bootstrap that, on first run, creates one Hermes job:
-
-- `name: "G2 morning brief"`, `schedule: "daily at 06:30"` (from the existing
-  config), `skills: [...]` (whatever the profile has for calendar/tasks),
-  `continuity: true` (dedupe against yesterday), `enabled_toolsets` tuned per
-  profile, and a prompt that carries the HUD constraints (≤60 chars per line,
-  ≤60 lines, plain text) that `morning-brief-prompt.ts:256` enforces today.
+- Morning brief and task dispatch recreated as Hermes jobs
+  (`deliver: "g2,ntfy"`, `continuity: true`, skills as needed). Jobs are
+  created once by `scripts/bootstrap-jobs.sh` from the existing
+  `morning-brief-config` values, then owned by Hermes.
 - `morning-brief-scheduler.ts`, `morning-brief-runtime.ts`,
-  `morning-brief-coverage.ts`, and the Cos source adapters are deleted. The
-  REST routes in `routes/morning-brief.ts` become thin wrappers over the job
-  (`GET` = job + last run, `POST /run` = `run`, `PATCH` = schedule/prompt).
+  `task-dispatcher.ts`, `task-store.ts` removed; `routes/morning-brief.ts`
+  and `routes/tasks.ts` return `410 Gone` with a pointer for one release.
+- Optional: `routes/jobs.ts` proxying an allowlisted subset of the API
+  server's `/api/jobs` (list, pause, resume, run, edit prompt/schedule) for a
+  phone-side editor. The chat-command path (`/cron list`, `/cron pause <id>`)
+  already covers the glasses; the proxy exists only if Oscar wants a
+  touch UI on the phone.
 
-**Tasks as cron jobs.** `task-dispatcher.ts` / `task-store.ts` (restricted
-read-only dispatch of scheduled prompts) map onto one-shot or recurring jobs
-with `enabled_toolsets` restricted. Their `done_when` guard has no Hermes
-equivalent; it becomes part of the prompt plus `continuity`.
+### 6.5 Phase 4 — launcher, health, config, ops
 
-**Inbox bridge (delivery to the glasses).** Hermes cannot deliver to G2. The
-plan offers two mechanisms, chosen by config, both landing in a new
-`hermes-inbox` display event on the display bus and a `GET /api/inbox`
-list for the phone:
+- `bin/cli.cjs`: delete Claude/Codex/Cursor probes and the `hasUsableAgent`
+  exit. Replace with: print plugin token status, list connected profiles,
+  probe the API server if `HERMES_API_KEY` is set. Warn, never exit: display,
+  speech and meetings work without Hermes.
+- `routes/health.ts`: `hermes: { profiles: [...], apiServer: ok|down,
+  inbox: n, pendingApprovals: n }`; drop `health-static-probes.ts` and
+  `provider-proof.ts`.
+- `.env.example`: `HERMES_PLUGIN_TOKEN`, `HERMES_API_URL`, `HERMES_API_KEY`,
+  `HERMES_DEFAULT_PROFILE`; delete every `COS_CLAUDE_*`, `COS_CODEX_*`,
+  `COS_CURSOR_*`, `COS_OLLAMA_*`, `COS_SCRIPTS_DIR`, `COS_OPERATIONS_DIR`.
+- `docs/ops-hermes.md`: unit ordering (`cos-glasses-server.service` before
+  `hermes-gateway-eve.service`, since the plugin connects to us), plugin
+  install per profile, removal of `cos-hermes-shim.service`,
+  `/opt/cos-glasses/hermes-ollama-shim.cjs` and `/home/cos/bin/claude` at
+  cutover.
 
-1. `HERMES_INBOX_MODE=poll` (default): after each job's `next_run_at` passes
-   (from `GET /api/jobs/{id}`), fetch the job and read `last_run` output.
-   Zero filesystem coupling, works across users/hosts, ~60 s latency.
-2. `HERMES_INBOX_MODE=local`: watch `${HERMES_HOME}/cron/output/{job_id}/`
-   with `fs.watch` when the gateway and this server share a host and user.
-   Immediate, but requires co-location and readable `HERMES_HOME`.
+### 6.6 Phase 5 — delete Cos
 
-`[SILENT]` runs produce no inbox entry. Failures do (Hermes always delivers
-failures). Each inbox item is also pushed as a session-less display card, so
-it appears on the lens without the phone asking.
-
-Open verification: whether the current Hermes build offers an HTTP/webhook
-delivery target (`hermes-webhook` appears in the platform toolset table). If
-it does, add `HERMES_INBOX_MODE=webhook` with a token-authenticated
-`POST /api/inbox/hermes` on this server and make it the default.
-
-Exit criteria: morning brief arrives on the lens from a Hermes cron job with
-no `morning-brief-scheduler` in-process; phone can pause/resume/run jobs.
-
-### 5.4 Phase 4 — Launcher, health, config, operations
-
-- `bin/cli.cjs`: delete the Claude/Codex/Cursor probes (`:194-361`) and the
-  `hasUsableAgent` exit. Replace with a Hermes reachability check that prints
-  the gateway URL, profile/model, and capabilities, and **warns but does not
-  exit** if the gateway is down (the server is still useful for display,
-  STT/TTS, meetings). `--setup-transcription` and `--setup-speaker-model`
-  stay.
-- `bin/managed-server.cjs` / `managed-runtime-contract.json`: remove
-  provider-related fields; add `hermes.ready`.
-- `routes/health.ts`: drop `health-static-probes.ts` CLI checks and
-  `provider-proof.ts`; add the cached capabilities plus a bounded
-  `GET /health/detailed` readout (status and counts only).
-- `.env.example`: rewrite the LLM section to `HERMES_*`; delete every
-  `COS_CLAUDE_*`, `COS_CODEX_*`, `COS_CURSOR_*`, `COS_OLLAMA_*`,
-  `COS_SCRIPTS_DIR`, `COS_OPERATIONS_DIR` key; keep network, token, media,
-  speech, durable-jobs keys.
-- Ops notes (`docs/ops-hermes.md`, not deployed): `cos-glasses-server.service`
-  gets `After=hermes-gateway.service` / `Wants=`; `cos-hermes-shim.service`
-  and `/opt/cos-glasses/hermes-ollama-shim.cjs` are removed at cutover; the
-  stub `/home/cos/bin/claude` is removed; `API_SERVER_HOST` stays `127.0.0.1`.
-- `network-policy.ts` unchanged: `:3141` never leaves Tailscale/LAN.
-
-### 5.5 Phase 5 — Delete Cos
-
-Delete (with their tests):
+Delete with tests:
 
 | Group | Files |
 |---|---|
-| Provider bridges | `claude-bridge.ts`, `codex-bridge.ts`, `cursor-bridge.ts`, `ollama-bridge.ts`, `model-router.ts` (replaced by 30-line Hermes call) |
-| Catalogs / sessions / ledgers | `codex-model-catalog.ts`, `codex-engine-sessions.ts`, `codex-extra-args.ts`, `codex-run-ledger.ts`, `cursor-model-catalog.ts`, `cursor-engine-sessions.ts`, `cursor-agent-store.ts`, `cursor-run-ledger.ts`, `claude-run-ledger.ts`, `claude-circuit.ts`, `claude-permissions.ts`, `claude-session-registry.ts`, `claude-tool-access.ts`, `banned-permission-args.ts`, `ollama-catalog.ts`, `ollama-run-ledger.ts`, `ollama-tools.ts`, `provider-binary.ts`, `provider-proof.ts`, `provider-terminal-error.ts`, `provider-process-lifecycle.ts`, `health-static-probes.ts` |
-| Cos mind | `context-builder.ts`, `context-files.ts`, `context-library-search.ts`, `cos-context-browser.ts`, `python-bridge.ts`, `profile.ts` owner-name reads, `routes/welcome-context.ts`; `response-cache.ts` is trimmed to the time/date instant answers (the calendar patterns read Cos context) |
-| Scheduling | `morning-brief-*.ts` (6 files), `task-dispatcher.ts`, `task-store.ts`, `routes/tasks.ts` |
+| Provider bridges | `claude-bridge.ts`, `codex-bridge.ts`, `cursor-bridge.ts`, `ollama-bridge.ts`, `model-router.ts` |
+| Catalogs / sessions / ledgers | `codex-*.ts` (4), `cursor-*.ts` (4), `claude-run-ledger.ts`, `claude-circuit.ts`, `claude-permissions.ts`, `claude-session-registry.ts`, `claude-tool-access.ts`, `banned-permission-args.ts`, `ollama-catalog.ts`, `ollama-run-ledger.ts`, `ollama-tools.ts`, `provider-binary.ts`, `provider-proof.ts`, `provider-terminal-error.ts`, `provider-process-lifecycle.ts`, `health-static-probes.ts` |
+| Cos mind | `context-builder.ts`, `context-files.ts`, `context-library-search.ts`, `cos-context-browser.ts`, `python-bridge.ts`, `profile.ts` owner-name reads, `routes/welcome-context.ts`, `routes/memory.ts`; `response-cache.ts` trimmed to time/date |
+| Scheduling | `morning-brief-*.ts` (6), `task-dispatcher.ts`, `task-store.ts`, `routes/tasks.ts`, `routes/morning-brief.ts` |
 | Desktop agent browsing | `agent-session-*.ts` (5), `attached-provider-adapter.ts`, `attached-workspace.ts`, `fork-thread.ts`, `thread-*.ts` (6), `occupancy-probes.ts`, `occupied-threads.ts`, `fence-liveness.ts`, `native-head.ts`, `native-thread-id.ts`, `stranded-session*.ts`, `session-stream-*.ts`, `session-transcript-watcher.ts`, `routes/agent-sessions.ts`, `routes/agent-session-bindings.ts`, `routes/agent-session-stream.ts`, `routes/claude-sessions.ts`, `routes/thread-turn-queue.ts`, `routes/threads.ts` |
-| Cos Operations | `cos-operations-meetings.ts`, `g2-ops-handoff.ts`, `live-cues-*.ts` (5), `routes/live-cues.ts`, `telegram-notify.ts` (Hermes' own Telegram channel supersedes it) |
+| Cos Operations | `cos-operations-meetings.ts`, `g2-ops-handoff.ts`, `live-cues-*.ts` (5), `routes/live-cues.ts`, `telegram-notify.ts` |
 
-Rewire instead of delete:
-
-- `dictation-clean.ts`, `prompt-edit.ts`, `archive.ts`, `meeting-summary.ts`
-  currently `spawn('claude', ['-p', …])`. Add
-  `hermes/utility.ts: completeOnce(instructions, input)` that calls
-  `/v1/chat/completions` non-streaming with a throwaway
-  `X-Hermes-Session-Id` and `enabled_toolsets: []` semantics via
-  instructions ("answer from the text only"). Same budgets as today
-  (`archive-budget.ts`, `meeting-summary-budget.ts`).
-- `routes/memory.ts`: Hermes exposes no memory REST API. Replace the memory
-  search route with a Hermes turn ("search your memory for …") in a
-  throwaway session, or drop the route and let the user ask. Decision for
-  Oscar; default is drop.
-- `handoff-store.ts` / `routes/handoffs.ts`: keep the G2 ↔ desktop handoff
-  shape but the `target` enum becomes `g2 | hermes-session`, implemented as
-  `POST /api/sessions/{id}/fork` + title.
+`handoff-store.ts` keeps the G2 ↔ desktop handoff shape with `target:
+'hermes-session'` implemented as a `/title`-named session the desktop can
+`/resume`.
 
 Identity strings: `rg -n "COS|Chief of Staff|gotcos" server shared bin` must
-return only the package name, the token header (`X-Cos-Token`, kept for phone
-compatibility), and env var prefixes (`COS_API_TOKEN`, `COS_DATA_DIR`, kept).
-Everything else is renamed or removed. Package name becomes
-`@oscarh30/glasses-server` (not published).
+return only the package name, `X-Cos-Token`, and the `COS_API_TOKEN` /
+`COS_DATA_DIR` env names (kept for phone compatibility). Package becomes
+`@oscarh30/glasses-server`, unpublished.
 
-Expected size after Phase 5: roughly 55–60k lines including tests, from 130k.
+Expected size after Phase 5: 50–55k lines including tests, from 130k, plus
+~1k lines of Python.
 
-### 5.6 Phase 6 — Even Hub contract and docs
+### 6.7 Phase 6 — Hub app contract
 
-The phone app is a separate Even Hub project. This phase only documents
-what it can rely on, so the HUD work can start against a fake:
-
-`docs/hud-api.md` — the stable server surface:
+`docs/hud-api.md` documents the server surface the Eve Hub app (separate
+repo) builds against:
 
 - Unchanged: `GET /api/health`, `GET /api/display-stream` (+ tickets),
-  `POST /api/query-jobs` (202 + reattach), `POST /api/query` (legacy SSE),
-  transcribe/TTS/media/meeting routes, `X-Cos-Token`.
-- New: `GET /api/agent/profiles`, `GET/POST /api/sessions`,
-  `POST /api/sessions/:id/fork`, `GET /api/sessions/:id/messages`,
-  `/api/jobs*`, `GET /api/inbox`, display events `tool_status`
-  (Hermes tool names), `hermes-inbox`, `approval_required`.
-- New display event `approval_required` → phone renders yes/no →
-  `POST /api/query-jobs/:id/approval` → `POST /v1/runs/{id}/approval`. Until
-  the HUD supports it, the server auto-denies after 60 s and shows
-  "Hermes needs approval; open the phone app."
-- `/v1/chat/completions` on `:3141` remains for Even's built-in "Add Agent"
-  and becomes a passthrough that injects the HUD instructions and the session
-  headers; `/v1/models` advertises the configured profiles.
+  `POST /api/query-jobs` (202 + reattach), transcribe / TTS / media routes,
+  `X-Cos-Token`.
+- New: `GET /api/agent/profiles`, `GET /api/inbox?since=`,
+  `POST /api/inbox/:id/read`, `POST /api/approvals/:id { choice }`, display
+  events `hermes_message`, `approval_required`, `approval_resolved`,
+  `agent_status`.
+- Resident-dashboard contract: on `FOREGROUND_ENTER_EVENT` reconnect the
+  display stream, `GET /api/inbox?since=<localStorage cursor>`, render the
+  newest card; persist cursor and profile in `localStorage`; on
+  `FOREGROUND_EXIT_EVENT` do nothing (iOS keeps running). Approvals render as
+  a list with Approve / Deny / Always plus a contextual-menu mirror; root
+  double-tap calls `shutDownPageContainer(1)`.
+- Voice: glasses mic → `/api/transcribe-stream` → text → `/api/query-jobs`,
+  unchanged.
 
-README and CHANGELOG get a `7.0.0` entry: Hermes-only, Cos removed, migration
-notes (`COS_G2_DEFAULT_MODEL` ignored, `HERMES_API_KEY` required).
+README and CHANGELOG get a `7.0.0` entry: Hermes platform, Cos removed,
+`HERMES_PLUGIN_TOKEN` required for Tier 2, `HERMES_API_KEY` for Tier 3.
 
-## 6. Testing strategy
+## 7. Testing
 
-- Unit/contract: the `fake-hermes` fixture drives every transport and error
-  branch; tests assert no request body ever contains `You are COS`, an owner
-  name, or replayed history.
-- Capability matrix: fixture variants with `run_submission=false`,
-  `session_*=false`, `session_key_header` absent, to prove the fallback
-  ladder.
-- Concurrency: two phone requests on one session → one Hermes run at a time;
-  a 429 surfaces as a lens message with `Retry-After`.
-- Durable jobs: submit, kill the SSE client, restart the server, reattach by
-  `run_id`, receive terminal state.
-- Cron: fixture job with `last_run` output → inbox card on the display bus;
-  `[SILENT]` suppressed; failure delivered.
-- Manual (dev box, not the VPS): `hermes profile create eve`, enable API
-  server on `8643`, run this server, pair the phone over Tailscale, walk
-  through chat / new chat / fork / brief.
-- Existing `vitest.config.ts` isolation (`COS_DATA_DIR`) is kept; add
-  `HERMES_API_URL=http://127.0.0.1:0` in test env so no test can reach a real
-  gateway by accident.
+- Python: plugin unit tests with `httpx.MockTransport`; a contract test that
+  imports only the four `gateway.*` symbols the ntfy adapter uses.
+- Node: `fake-hermes-plugin` fixture that speaks the 4.3 protocol, driving
+  inbox replay (`Last-Event-ID`), approval long-poll timeout, correlation of
+  `deliver` to jobs, multi-profile streams, loopback + token rejection.
+- Integration (dev box, not the VPS): `hermes profile create eve-dev`, install
+  the plugin, run this server, exercise: `cron create "in 1m" … --deliver
+  g2`; a gated tool → approval on `/api/approvals`; a query job round trip;
+  `/new`; kill the gateway mid-turn → job fails with the lens-safe message and
+  the adapter reconnects.
+- Tier 1 check is manual: a `deliver: ntfy` job pops on the lens while
+  Navigate is the foreground glasses app.
+- `vitest.config.ts` isolation (`COS_DATA_DIR`) kept; add
+  `HERMES_API_URL=http://127.0.0.1:0` and `HERMES_PLUGIN_TOKEN=test` so no
+  test reaches a real gateway.
 
-## 7. Risks and open decisions
+## 8. Risks and open decisions
 
 | # | Item | Proposed default | Needs Oscar |
 |---|---|---|---|
-| 1 | Hermes model id on `:8643` is the profile name, not `hermes-agent` | Read `/v1/models`; optionally set `API_SERVER_MODEL_NAME=hermes-agent` in the profile `.env` | No |
-| 2 | Cron delivery to G2 has no native target | Poll mode; verify webhook target and switch if available | Yes: which mode |
-| 3 | Memory search route has no Hermes REST equivalent | Drop `routes/memory.ts` | Yes |
-| 4 | Agentic turns can exceed Even app timeouts | Runs API + keepalive comments + reattach; HUD shows tool status | No |
-| 5 | Hermes API is moving (July 2026 auth change on `/p/<profile>/`) | Capabilities probe, `HERMES_MIN_VERSION` check from `/health/detailed` when available | No |
-| 6 | Existing `sessions.json` history is not importable into Hermes | Keep read-only under `legacy/`; start fresh | Yes: OK to not migrate |
-| 7 | `API_SERVER_KEY` grants terminal access | Only this server holds it; proxy allowlist; never returned to phone; never logged | No |
-| 8 | Meetings/live-cues used Cursor Composer | Live cues deleted; meeting summary via `completeOnce` | Yes: confirm live cues can go |
-| 9 | Package identity / upstream sync | Rename package, stop tracking upstream after 7.0.0 (diverged too far) | Yes |
+| 1 | Android WebView suspension makes the resident dashboard "works when open" | Design for iOS; document Android as degraded | Confirm phone platform |
+| 2 | Hermes platform-plugin imports are being decomposed (Sep 2026 `PLUGIN-COMPAT`) | Pin the Hermes version in `docs/ops-hermes.md`; import only `BasePlatformAdapter`, `MessageEvent`, `MessageType`, `SendResult`, `PlatformConfig`, `Platform` | No |
+| 3 | Approval transport denies on any failure by default | Set `transport_fallback: builtin` so an unanswered glasses prompt re-appears on the originating chat | Yes: accept that fallback |
+| 4 | Public `ntfy.sh` sees notification text | Self-hosted ntfy on the VPS behind Tailscale, or Telegram | Yes: channel choice |
+| 5 | Gateway path delivers whole answers, not token streams | Accept for the HUD; Tier 3 keeps streaming | No |
+| 6 | Plugin runs in-process in Hermes with full trust; server `/hermes/*` is loopback-only | Token + loopback guard; never proxy arbitrary Hermes endpoints to the phone | No |
+| 7 | Existing `sessions.json` history is not importable into Hermes | Keep read-only under `legacy/`; start fresh | Yes |
+| 8 | `routes/memory.ts` has no Hermes REST equivalent | Drop; ask Eve in chat | Yes |
+| 9 | Live cues used Cursor Composer | Delete | Yes |
+| 10 | Package identity / upstream sync | Rename, stop tracking upstream after 7.0.0 | Yes |
+| 11 | Phone-side job editor | Chat commands only unless asked | Yes |
 
-## 8. Out of scope
+## 9. Out of scope
 
-- Writing a native Hermes gateway platform ("g2" adapter in Python). It
-  would make G2 a first-class delivery target and remove the inbox bridge,
-  but it lives in the Hermes repo, not here. Revisit after Phase 3.
-- The Even Hub app itself.
+- The Even Hub app itself (separate repo; contract in `docs/hud-api.md`).
+- Publishing the plugin to the Hermes community index.
 - Deploying any of this to `100.87.43.24`.
